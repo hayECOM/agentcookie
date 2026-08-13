@@ -95,8 +95,8 @@ func TestBuildCookieParam_HappyPath(t *testing.T) {
 	if got.URL != "https://instacart.com/api/v2" {
 		t.Errorf("URL: got %q", got.URL)
 	}
-	if got.Domain != "instacart.com" {
-		t.Errorf("Domain (leading dot must be stripped): got %q", got.Domain)
+	if got.Domain != ".instacart.com" {
+		t.Errorf("Domain (leading dot must be preserved): got %q", got.Domain)
 	}
 	if got.Path != "/api/v2" {
 		t.Errorf("Path: got %q", got.Path)
@@ -115,25 +115,6 @@ func TestBuildCookieParam_HappyPath(t *testing.T) {
 	}
 	if got.Expires == nil {
 		t.Errorf("Expires: got nil, want non-nil for persistent cookie")
-	}
-}
-
-// TestNormalizeDomain covers the leading-dot strip that Chrome's CDP
-// API requires. Chrome's SQLite stores ".example.com" for parent-domain
-// scope, but Network.setCookies silently rejects that shape.
-func TestNormalizeDomain(t *testing.T) {
-	cases := []struct{ in, want string }{
-		{".instacart.com", "instacart.com"},
-		{"instacart.com", "instacart.com"},
-		{".sub.example.com", "sub.example.com"},
-		{"", ""},
-		{".", ""},
-	}
-	for _, tc := range cases {
-		got := normalizeDomain(tc.in)
-		if got != tc.want {
-			t.Errorf("normalizeDomain(%q): got %q, want %q", tc.in, got, tc.want)
-		}
 	}
 }
 
@@ -182,13 +163,15 @@ func TestBuildCookieParam_HostPrefixRejectionGuard(t *testing.T) {
 	}
 }
 
-// TestBuildCookieParam_DomainCookieKeepsDomain confirms a genuinely
-// domain-scoped cookie (leading dot, not __Host-) still carries its
-// dot-stripped Domain so its subdomain scope round-trips.
-func TestBuildCookieParam_DomainCookieKeepsDomain(t *testing.T) {
+// TestBuildCookieParam_DomainCookieKeepsLeadingDot confirms a genuinely
+// domain-scoped cookie (leading dot, not __Host-) carries its host_key
+// through VERBATIM, dot included. Stripping the dot is what silently
+// demoted domain cookies to host-only rows on the sink, so they never
+// rode to any subdomain (e.g. www.airbnb.com).
+func TestBuildCookieParam_DomainCookieKeepsLeadingDot(t *testing.T) {
 	c := chrome.Cookie{HostKey: ".example.com", Name: "sess", Value: "v", Path: "/", IsSecure: 1}
 	got := buildCookieParam(c, "v")
-	if got.Domain != "example.com" {
-		t.Errorf("domain cookie must keep dot-stripped Domain, got %q", got.Domain)
+	if got.Domain != ".example.com" {
+		t.Errorf("domain cookie must keep its leading dot, got %q", got.Domain)
 	}
 }

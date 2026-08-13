@@ -43,16 +43,7 @@ func InjectCookies(ctx context.Context, profileDir string, cookies []chrome.Cook
 		return nil
 	}
 
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.UserDataDir(expanded),
-		chromedp.Flag("headless", true),
-		chromedp.Flag("disable-gpu", true),
-		// Disable the first-run + welcome experiences so chromedp
-		// doesn't hang on a first-launch UI dialog when the profile
-		// dir was created fresh by the wizard.
-		chromedp.Flag("no-first-run", true),
-		chromedp.Flag("no-default-browser-check", true),
-	)
+	opts := append(injectorAllocatorOptions(), chromedp.UserDataDir(expanded))
 	allocCtx, allocCancel := chromedp.NewExecAllocator(ctx, opts...)
 	defer allocCancel()
 
@@ -104,14 +95,17 @@ func InjectCookies(ctx context.Context, profileDir string, cookies []chrome.Cook
 //     cookies, host-only vs subdomain semantics flake). With URL set,
 //     Chrome treats the cookie as if a real navigation set it.
 //
-//  2. Strip the leading "." from Domain. Chrome's encrypted cookies
+//  2. Pass Domain through with its leading "." intact. Chrome's cookies
 //     SQLite stores host_key as ".instacart.com" to mark parent-domain
-//     scope (valid for all subdomains). The modern CDP API does NOT
-//     accept Domain values starting with "." -- it rejects them
-//     silently. The post-dot domain ("instacart.com") with explicit
-//     Domain attribute set produces the same subdomain-wildcard scope
-//     Chrome would derive from the same Set-Cookie header sent by the
-//     server, so the semantics round-trip correctly.
+//     scope (valid for all subdomains) and "instacart.com" for
+//     host-only. Network.setCookies preserves that distinction verbatim,
+//     so the dot must ride along: a dotless Domain -- with or without a
+//     URL, and regardless of the URL's host -- lands as a HOST-ONLY row,
+//     which never rides to www.instacart.com. That is the 2026-08 sink
+//     bug: 1762 of 1883 domain-scoped cookies arrived host-only, so
+//     every subdomain request went out unauthenticated even when the
+//     rows were otherwise readable. Verified against Chrome 151 in
+//     TestLiveInject_PreservesDomainScope.
 func buildCookieParam(c chrome.Cookie, value string) *network.CookieParam {
 	p := &network.CookieParam{
 		Name:     c.Name,
@@ -137,7 +131,7 @@ func buildCookieParam(c chrome.Cookie, value string) *network.CookieParam {
 	// silently dropped host-bound login cookies before this fix.
 	isHostPrefixed := strings.HasPrefix(c.Name, "__Host-")
 	if strings.HasPrefix(c.HostKey, ".") && !isHostPrefixed {
-		p.Domain = normalizeDomain(c.HostKey)
+		p.Domain = c.HostKey
 	}
 
 	// __Host- cookies have mandatory attributes (Secure, Path "/"); enforce
@@ -148,16 +142,6 @@ func buildCookieParam(c chrome.Cookie, value string) *network.CookieParam {
 	}
 
 	return p
-}
-
-// normalizeDomain converts Chrome's host_key form to the CDP-acceptable
-// Domain shape. Chrome's SQLite stores ".example.com" for parent-domain
-// scope; CDP requires the leading dot dropped.
-func normalizeDomain(hostKey string) string {
-	if len(hostKey) > 0 && hostKey[0] == '.' {
-		return hostKey[1:]
-	}
-	return hostKey
 }
 
 // synthesizeCookieURL builds a request-URI for a cookie from its
