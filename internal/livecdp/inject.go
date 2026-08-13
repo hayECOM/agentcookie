@@ -48,9 +48,10 @@ func Inject(ctx context.Context, cookies []chrome.Cookie) error {
 }
 
 // BuildCookieParams shapes decrypted chrome.Cookie rows into CDP
-// CookieParams for live injection. The shaping is the corrected,
-// verified-working form -- it differs from internal/cdp.buildCookieParam
-// in two load-bearing ways the cold path got wrong:
+// CookieParams for live injection. internal/cdp.buildCookieParam now
+// agrees with this function on all three rules below -- it did not when
+// this comment was written, and the cold path's dot-stripping was fixed
+// in 2026-08 -- so keep the two in step when either changes:
 //
 //   - __Host--prefixed cookies carry NO Domain. Chrome hard-rejects a
 //     __Host- cookie that has a Domain attribute, which silently dropped

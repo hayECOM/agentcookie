@@ -10,6 +10,7 @@ import (
 
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/cdproto/storage"
 	"github.com/chromedp/chromedp"
 
 	"github.com/mvanhorn/agentcookie/internal/chrome"
@@ -66,6 +67,30 @@ func InjectCookies(ctx context.Context, profileDir string, cookies []chrome.Cook
 		params = append(params, buildCookieParam(c, c.Value))
 	}
 
+	// Converge away stale host-only twins BEFORE writing. See
+	// staleHostOnlyTwins: host_key is part of Chrome's cookie unique key,
+	// so a dotless row left behind by an older injector coexists with the
+	// dotted row we are about to write instead of being replaced by it.
+	// Deleting first (rather than after) means a legitimate host-only
+	// cookie can never be left missing by a partial failure -- the delete
+	// set already excludes everything this batch writes host-only, and
+	// anything we do delete is re-created by the SetCookies below if the
+	// source still carries it.
+	if err := chromedp.Run(chromeCtx, chromedp.ActionFunc(func(ctx context.Context) error {
+		existing, err := storage.GetCookies().Do(ctx)
+		if err != nil {
+			return fmt.Errorf("Storage.getCookies: %w", err)
+		}
+		for _, del := range staleHostOnlyTwins(existing, cookies) {
+			if err := del.Do(ctx); err != nil {
+				return fmt.Errorf("Network.deleteCookies: %w", err)
+			}
+		}
+		return nil
+	})); err != nil {
+		return fmt.Errorf("cdp.InjectCookies: converge host-only twins (profile=%s): %w", profileDir, err)
+	}
+
 	if err := chromedp.Run(chromeCtx, network.SetCookies(params)); err != nil {
 		return fmt.Errorf("cdp.InjectCookies: Network.SetCookies (%d cookies, profile=%s): %w", len(params), profileDir, err)
 	}
@@ -84,6 +109,87 @@ func InjectCookies(ctx context.Context, profileDir string, cookies []chrome.Cook
 		return fmt.Errorf("cdp.InjectCookies: graceful close (flush): %w", err)
 	}
 	return nil
+}
+
+// twinKey identifies a cookie the way Chrome's storage does for our
+// purposes: host, name and path. host is the host_key form WITHOUT a
+// leading dot, so a domain row and its host-only twin share a key.
+type twinKey struct {
+	host string
+	name string
+	path string
+}
+
+// staleHostOnlyTwins returns the deletes needed to converge a profile
+// that an OLDER injector wrote.
+//
+// host_key is part of Chrome's cookie unique key, so "example.com" and
+// ".example.com" are two distinct rows, not one row being updated. The
+// pre-fix injector stripped the leading dot and wrote domain cookies as
+// host-only; the fixed injector writes the dotted row. Because the sink's
+// profile is long-lived and never wiped, both then coexist -- and on an
+// apex request the reader sends BOTH, with the older (stale) one ordered
+// first per RFC 6265. Apex requests therefore authenticate with a dead or
+// rotated token while subdomains work: the exact inverse of the scoping
+// bug, and it persists until the stale row expires on its own.
+//
+// The convergence has to be surgical, because a host-only cookie sharing
+// a name with a domain cookie is NOT automatically stale -- it is a
+// common real pattern (consent and analytics cookies especially), and
+// this sink's own source carries eight such legitimate pairs. So a row is
+// deleted only when all of these hold:
+//
+//   - it already exists in the profile (nothing speculative), and
+//   - it is host-only (no leading dot), and
+//   - this batch does NOT write that same host-only row, and
+//   - this batch DOES write the dotted row that shadows it.
+//
+// Chrome's Network.deleteCookies matches host_key exactly, so passing the
+// dotless domain removes the host-only row and leaves the dotted one --
+// verified against Chrome 151.
+//
+// After one pass the profile has converged and this returns nothing, so
+// the steady-state cost is a single Storage.getCookies per sync.
+func staleHostOnlyTwins(existing []*network.Cookie, batch []chrome.Cookie) []*network.DeleteCookiesParams {
+	writesHostOnly := map[twinKey]bool{}
+	writesDotted := map[twinKey]bool{}
+	for _, c := range batch {
+		host := strings.TrimPrefix(c.HostKey, ".")
+		if host == "" || c.Name == "" {
+			continue
+		}
+		path := c.Path
+		if path == "" {
+			path = "/"
+		}
+		// Mirror buildCookieParam: __Host- cookies are always written
+		// host-only at path "/", whatever the source row says, so they
+		// must never be treated as the dotted half of a twin.
+		if strings.HasPrefix(c.Name, "__Host-") {
+			writesHostOnly[twinKey{host, c.Name, "/"}] = true
+			continue
+		}
+		if strings.HasPrefix(c.HostKey, ".") {
+			writesDotted[twinKey{host, c.Name, path}] = true
+		} else {
+			writesHostOnly[twinKey{host, c.Name, path}] = true
+		}
+	}
+
+	var deletes []*network.DeleteCookiesParams
+	seen := map[twinKey]bool{}
+	for _, e := range existing {
+		if e == nil || strings.HasPrefix(e.Domain, ".") {
+			continue
+		}
+		k := twinKey{e.Domain, e.Name, e.Path}
+		if seen[k] || writesHostOnly[k] || !writesDotted[k] {
+			continue
+		}
+		seen[k] = true
+		deletes = append(deletes, network.DeleteCookies(k.name).WithDomain(k.host).WithPath(k.path))
+	}
+	return deletes
 }
 
 // buildCookieParam translates a chrome.Cookie row into a CDP

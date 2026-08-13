@@ -6,10 +6,21 @@
 //
 //	go test -tags livechrome ./internal/cdp/...
 //
-// These are the regression guards for the two sink defects fixed in
-// 2026-08: cookies landing host-only (dot stripped off host_key) and
-// cookies landing encrypted under Chrome's mock-keychain key, which a
-// normally-launched Chrome cannot decrypt and therefore purges.
+// These are the regression guards for the three sink defects fixed in
+// 2026-08:
+//
+//  1. Domain cookies landed host-only because the injector stripped the
+//     leading dot off host_key, so they never rode to any subdomain.
+//  2. Cookies were sealed under the WRONG os_crypt key. Note the
+//     direction, because the first attempt at this fix had it backwards
+//     and purged the live profile: the reader is an automation launcher
+//     running Chrome with --use-mock-keychain, so sealing under the mock
+//     key is CORRECT and required. Sealing under the machine's real OS
+//     keyring is what destroys the profile. allocator.go carries the
+//     measurements; do not "fix" osCryptFlags away.
+//  3. Stale host-only rows written by the pre-fix injector survived
+//     alongside the corrected dotted rows and shadowed them on apex
+//     requests. InjectCookies now converges them away.
 package cdp
 
 import (
@@ -24,6 +35,10 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/chromedp"
 
 	_ "github.com/mattn/go-sqlite3"
 
@@ -144,20 +159,19 @@ func TestLiveInject_PreservesDomainScope(t *testing.T) {
 // TestLiveInject_SealsUnderAutomationKey guards the encryption key. The
 // seeded profile is read back by an automation launcher (agent-browser,
 // Playwright, Puppeteer, chromedp), all of which run Chrome with
-// --use-mock-keychain, so rows must be sealed under the key derived from
-// "mock_password". Sealing under the machine's real Safe Storage key
-// instead looks correct on disk and is purged wholesale -- measured
-// 0/5 survivors -- the first time the reader opens the profile.
+// --use-mock-keychain / --password-store=basic, so rows must be sealed
+// under the key that pairing produces on THIS platform (see
+// automationSealSecret -- macOS and Linux differ in both secret and
+// round count). Sealing under the machine's real OS keyring instead
+// looks correct on disk and is purged wholesale -- measured 0/5
+// survivors -- the first time the reader opens the profile.
 func TestLiveInject_SealsUnderAutomationKey(t *testing.T) {
 	stored := readStored(t, injectIntoTempProfile(t))
 	if len(stored) == 0 {
 		t.Fatal("no probe cookies were stored")
 	}
 
-	mockKey, err := chrome.DeriveAESKey("mock_password")
-	if err != nil {
-		t.Fatal(err)
-	}
+	mockKey := automationSealKey(t)
 	var realKey []byte
 	if password, err := chrome.SafeStoragePassword(); err == nil {
 		if k, err := chrome.DeriveAESKey(password); err == nil {
@@ -224,6 +238,116 @@ func aesCBCDecrypt(encrypted, key []byte) ([]byte, bool) {
 		}
 	}
 	return out[:len(out)-pad], true
+}
+
+// TestLiveInject_ConvergesStaleHostOnlyTwin is the upgrade-path guard,
+// end to end against a real Chrome. It seeds a profile the way the
+// PRE-FIX injector did -- domain cookies written host-only, dot stripped
+// -- then runs the real InjectCookies over it and asserts the stale
+// host-only row is gone rather than coexisting with the dotted one.
+//
+// Without convergence both rows survive, and an apex request sends both
+// with the stale one ordered first (RFC 6265 orders by creation time),
+// so the apex authenticates with a dead token while subdomains work.
+func TestLiveInject_ConvergesStaleHostOnlyTwin(t *testing.T) {
+	requireChrome(t)
+	profile := filepath.Join(t.TempDir(), "chrome-profile")
+	if err := os.MkdirAll(profile, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed as the OLD injector would: dot stripped, so host-only. Also
+	// seed a legitimate host-only cookie whose name is shared with a
+	// domain cookie in the batch -- it must survive.
+	seedAsOldInjector(t, profile, []*network.CookieParam{
+		cookieParam("agentcookie_domain_probe", "stale-apex-token", "", "https://example.com/"),
+		cookieParam("agentcookie_legit_twin", "legit-host-only", "", "https://example.com/"),
+	})
+	before := readAll(t, profile)
+	if before[twinKey{"example.com", "agentcookie_domain_probe", "/"}] == "" {
+		t.Fatalf("seed failed: no stale host-only row to converge, got %v", before)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	batch := append(liveProbeCookies(),
+		chrome.Cookie{
+			HostKey: ".example.com", Name: "agentcookie_legit_twin", Value: "v",
+			Path: "/", IsSecure: 1, SameSite: -1, SourceScheme: 2, SourcePort: 443,
+		},
+		chrome.Cookie{
+			HostKey: "example.com", Name: "agentcookie_legit_twin", Value: "v",
+			Path: "/", IsSecure: 1, SameSite: -1, SourceScheme: 2, SourcePort: 443,
+		},
+	)
+	if err := InjectCookies(ctx, profile, batch); err != nil {
+		t.Fatalf("InjectCookies: %v", err)
+	}
+
+	after := readAll(t, profile)
+	if _, still := after[twinKey{"example.com", "agentcookie_domain_probe", "/"}]; still {
+		t.Errorf("stale host-only twin survived the inject; it shadows the dotted row on apex requests")
+	}
+	if _, ok := after[twinKey{".example.com", "agentcookie_domain_probe", "/"}]; !ok {
+		t.Errorf("the dotted row is missing after convergence -- the delete took the wrong row")
+	}
+	// The legitimate pair the source genuinely carries must both remain.
+	for _, host := range []string{"example.com", ".example.com"} {
+		if _, ok := after[twinKey{host, "agentcookie_legit_twin", "/"}]; !ok {
+			t.Errorf("legitimate %q twin was destroyed by convergence", host)
+		}
+	}
+}
+
+// seedAsOldInjector writes params into profile with a plain Chrome
+// session, standing in for a profile written by the pre-fix injector.
+func seedAsOldInjector(t *testing.T, profile string, params []*network.CookieParam) {
+	t.Helper()
+	opts := append(injectorAllocatorOptions(), chromedp.UserDataDir(profile))
+	allocCtx, c1 := chromedp.NewExecAllocator(context.Background(), opts...)
+	defer c1()
+	ctx, c2 := chromedp.NewContext(allocCtx)
+	defer c2()
+	if err := chromedp.Run(ctx, network.SetCookies(params)); err != nil {
+		t.Fatalf("seed SetCookies: %v", err)
+	}
+	if err := chromedp.Cancel(ctx); err != nil {
+		t.Fatalf("seed close: %v", err)
+	}
+}
+
+func cookieParam(name, value, domain, url string) *network.CookieParam {
+	exp := cdp.TimeSinceEpoch(time.Now().Add(48 * time.Hour))
+	p := &network.CookieParam{Name: name, Value: value, URL: url, Path: "/", Secure: true, Expires: &exp}
+	if domain != "" {
+		p.Domain = domain
+	}
+	return p
+}
+
+// readAll returns every row in the profile's Cookies db keyed by
+// host_key/name/path. Values are never read.
+func readAll(t *testing.T, profile string) map[twinKey]string {
+	t.Helper()
+	db, err := sql.Open("sqlite3", "file:"+filepath.Join(profile, "Default", "Cookies")+"?mode=ro&_busy_timeout=2000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT host_key, name, path FROM cookies`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	out := map[twinKey]string{}
+	for rows.Next() {
+		var k twinKey
+		if err := rows.Scan(&k.host, &k.name, &k.path); err != nil {
+			t.Fatal(err)
+		}
+		out[k] = k.host
+	}
+	return out
 }
 
 func keysOf(m map[string]storedRow) []string {
