@@ -64,11 +64,27 @@ That lane was silently broken until 2026-08-13. Both defects were in
    matter what URL accompanies it — so it never rides to `www.`. Stripping the dot
    demoted 1762 of 1883 domain-scoped cookies. Guard:
    `TestBuildCookieParam_DomainCookieKeepsLeadingDot`.
+3. **Stale host-only twins must be converged away, surgically.** `host_key` is
+   part of Chrome's cookie unique key, so the dotted row written by fix #2 does
+   not *replace* the dotless row an older injector wrote — they coexist, and on
+   an apex request the reader sends both with the stale one ordered first (RFC
+   6265). The apex then authenticates with a dead token while subdomains work.
+   `staleHostOnlyTwins` deletes the shadowed row before each write. **It must
+   stay surgical:** a host-only cookie sharing a name with a domain cookie is
+   *not* automatically stale — this sink's source carries eight legitimate pairs
+   (`OptanonConsent`, `__cuid`, `oai_consent_*`, …), and a blunt "delete the
+   dotless twin" destroys them. Guards: the `TestStaleHostOnlyTwins_*` unit tests
+   and `TestLiveInject_ConvergesStaleHostOnlyTwin`.
 
 A purged profile fails *silently and asymmetrically*: it looks correctly seeded
 on disk, and the reader's own fresh anonymous cookies survive while the synced
 auth rows vanish. Never conclude the lane works from a row count taken before the
 reader has opened the profile.
+
+The profile at `~/.agentcookie/chrome-profile` is **long-lived and never wiped**,
+so any injector change that alters how a row is keyed (`host_key`, name, path)
+leaves the old rows behind rather than updating them. Ask what happens to the
+rows already on disk, not just what the next write produces.
 
 ## Tests
 
