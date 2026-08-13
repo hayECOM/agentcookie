@@ -141,25 +141,28 @@ func TestLiveInject_PreservesDomainScope(t *testing.T) {
 	}
 }
 
-// TestLiveInject_UsesRealSafeStorageKey guards the encryption key. Rows
-// must decrypt under the machine's real Chrome Safe Storage key, because
-// that is the key a normally-launched Chrome uses. Rows written under
-// Chrome's mock-keychain key ("mock_password") look fine on disk and are
-// silently purged the first time a real Chrome opens the profile.
-func TestLiveInject_UsesRealSafeStorageKey(t *testing.T) {
+// TestLiveInject_SealsUnderAutomationKey guards the encryption key. The
+// seeded profile is read back by an automation launcher (agent-browser,
+// Playwright, Puppeteer, chromedp), all of which run Chrome with
+// --use-mock-keychain, so rows must be sealed under the key derived from
+// "mock_password". Sealing under the machine's real Safe Storage key
+// instead looks correct on disk and is purged wholesale -- measured
+// 0/5 survivors -- the first time the reader opens the profile.
+func TestLiveInject_SealsUnderAutomationKey(t *testing.T) {
 	stored := readStored(t, injectIntoTempProfile(t))
+	if len(stored) == 0 {
+		t.Fatal("no probe cookies were stored")
+	}
 
-	password, err := chrome.SafeStoragePassword()
-	if err != nil {
-		t.Skipf("cannot read Chrome Safe Storage from Keychain here: %v", err)
-	}
-	realKey, err := chrome.DeriveAESKey(password)
-	if err != nil {
-		t.Fatal(err)
-	}
 	mockKey, err := chrome.DeriveAESKey("mock_password")
 	if err != nil {
 		t.Fatal(err)
+	}
+	var realKey []byte
+	if password, err := chrome.SafeStoragePassword(); err == nil {
+		if k, err := chrome.DeriveAESKey(password); err == nil {
+			realKey = k
+		}
 	}
 
 	for name, row := range stored {
@@ -167,11 +170,11 @@ func TestLiveInject_UsesRealSafeStorageKey(t *testing.T) {
 			t.Errorf("%s: encrypted_value empty (plaintext fallback, value=%q)", name, row.plaintext)
 			continue
 		}
-		if decryptsUnder(row, mockKey) {
-			t.Errorf("%s: row decrypts under the MOCK keychain key -- a real Chrome will purge it on first launch", name)
+		if !decryptsUnder(row, mockKey) {
+			t.Errorf("%s: row does NOT decrypt under the automation (mock keychain) key the reader will use", name)
 		}
-		if !decryptsUnder(row, realKey) {
-			t.Errorf("%s: row does NOT decrypt under this machine's real Chrome Safe Storage key", name)
+		if realKey != nil && decryptsUnder(row, realKey) {
+			t.Errorf("%s: row is sealed under the real OS keyring key; an automation reader cannot decrypt it and will purge the profile", name)
 		}
 	}
 }

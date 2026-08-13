@@ -9,36 +9,47 @@ type injectorFlag struct {
 	value any
 }
 
-// keyringPoisoningFlags are the switches that change which key Chrome's
-// os_crypt uses to seal cookie values. They must never appear on the
-// injector's command line.
+// osCryptFlags are the switches that decide WHICH KEY Chrome's os_crypt
+// uses to seal cookie values on macOS/Linux. They are the single most
+// load-bearing thing on this path, and they are pinned here on purpose.
 //
-// This is the 2026-08 sink bug. chromedp.DefaultExecAllocatorOptions
-// ships --use-mock-keychain (and --password-store=basic) because a
-// throwaway automation Chrome has no reason to touch the real OS
-// keyring. Our injector is the opposite case: it seeds a profile that a
-// normally-launched Chrome opens later. Under --use-mock-keychain,
-// macOS Chrome derives its AES key from the literal string
-// "mock_password" instead of the login Keychain's "Chrome Safe Storage"
-// item. Every row lands sealed under a key the real Chrome does not
-// hold, so the first real launch fails to decrypt them and PURGES them
-// -- the profile looks correctly seeded on disk right up until the
-// moment it is used. (--password-store=basic is the same failure on
-// Linux: hardcoded "peanuts" instead of the desktop keyring.)
+// The seeded profile is only ever read back by an automation launcher --
+// agent-browser, Playwright, Puppeteer, chromedp -- and every one of
+// those launches Chrome with --use-mock-keychain (and
+// --password-store=basic), which makes Chrome derive its AES key from
+// the literal string "mock_password" instead of touching the OS keyring.
+// The injector MUST seal under the same key the reader will unseal with,
+// or Chrome drops every row it cannot decrypt the first time the profile
+// is opened -- silently, and the profile looks perfectly seeded on disk
+// right up until that moment.
 //
-// injectorFlags is therefore an explicit list rather than
-// chromedp.DefaultExecAllocatorOptions plus overrides: a chromedp
-// upgrade must not be able to reintroduce a keyring flag silently, and
-// chromedp.Flag cannot un-set a string flag like --password-store once
-// the defaults have set it.
-var keyringPoisoningFlags = []string{"use-mock-keychain", "password-store"}
+// Measured on this machine (Chrome 151 injector, agent-browser's Google
+// Chrome for Testing 150 reader, 2026-08-13):
+//
+//	injector --use-mock-keychain  -> 5/5 seeded rows survive the read
+//	injector on the real keyring  -> 0/5 survive; whole DB is purged
+//
+// So this is NOT "the automation default is wrong, override it". It is
+// "the automation default is required, pin it". Today these values are
+// inherited by accident from chromedp.DefaultExecAllocatorOptions; listed
+// explicitly, a chromedp upgrade can neither remove them nor change them
+// without TestInjectorFlagsPinOSCrypt going red.
+//
+// If a deployment ever reads this profile with a NORMALLY launched
+// Google Chrome (real "Chrome Safe Storage" Keychain item), these two
+// flags are exactly what has to change -- and everything else here can
+// stay put.
+var osCryptFlags = []injectorFlag{
+	{"use-mock-keychain", true},
+	{"password-store", "basic"},
+}
 
 // injectorFlags mirrors chromedp.DefaultExecAllocatorOptions (itself
-// modeled on Puppeteer's defaults) minus keyringPoisoningFlags, plus the
-// headless/first-run switches the injector needs. Keep it in sync with
-// chromedp on upgrade; TestInjectorFlagsNoKeyringPoisoning guards the
-// part that matters.
-var injectorFlags = []injectorFlag{
+// modeled on Puppeteer's defaults) plus the headless/first-run switches
+// the injector needs. Kept as an explicit list rather than
+// chromedp.DefaultExecAllocatorOptions so the os_crypt flags above are
+// visible and pinned; keep the rest in sync with chromedp on upgrade.
+var injectorFlags = append([]injectorFlag{
 	// Headless, and no first-run/welcome UI: the wizard may have just
 	// created this profile dir, and a launchd sink has no one to
 	// dismiss a dialog.
@@ -70,7 +81,7 @@ var injectorFlags = []injectorFlag{
 	{"metrics-recording-only", true},
 	{"safebrowsing-disable-auto-update", true},
 	{"enable-automation", true},
-}
+}, osCryptFlags...)
 
 // injectorAllocatorOptions renders injectorFlags as chromedp allocator
 // options. Callers append UserDataDir themselves.
