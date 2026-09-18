@@ -98,6 +98,14 @@ profile and assert against the resulting SQLite that domain scope survives and
 that rows are sealed under the automation key. They are the regression guards for
 both defects above; they fail on the pre-fix commit.
 
+`internal/cdp/localstorage_live_test.go` is the guard for the localStorage
+receiver. It seeds a fake "laptop" profile through Chrome, packs it the way the
+source does, installs it into a second profile that already has its own
+localStorage, and asserts the three properties that make the receiver safe to
+point at a long-lived reader profile: the synced origin arrives, a blocklisted
+origin does not, and the reader's own origins survive. Swap the per-origin write
+for a directory replace and the last two go red.
+
 ## Rebuild / install / bounce
 
 ```bash
@@ -133,44 +141,121 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.agentcookie.sink.pli
 Cookies only flush to SQLite on a clean browser shutdown, so always
 `agent-browser close --all` before the post-launch read.
 
-## localStorage / IndexedDB do NOT reach this sink (as of 2026-09-18)
+## localStorage: how it reaches this sink (and how it must never reach it)
 
 Upstream has carried localStorage + IndexedDB sync since v0.7 (protocol v2,
-`LocalStorageTarball` / `IndexedDBTarball`). **None of it lands on this
-machine**, and the reason is this sink's own config, not the laptop source:
+`LocalStorageTarball` / `IndexedDBTarball`), but **none of it reached this
+machine until 2026-09-18**, for three independent reasons worth keeping in
+mind because two of them are still true:
 
 1. `skip_chrome_sqlite: true` routes every `/sync` through
    `applySidecarOnlyToSink`, which writes the cookie sidecar and returns.
-   Both tarballs are decoded off the wire and then dropped on the floor.
-2. Even with that flag off, `applyEnvelopeToSink` installs the tarballs into
-   `chromepaths.LocalStorageLevelDB()` -- the machine's **real** Chrome
-   Default profile -- not into `~/.agentcookie/chrome-profile`, which is the
-   profile `agent-browser` actually reads.
-3. The CDP injector is cookies-only (`Network.setCookies`). Nothing in
-   `internal/cdp`, locally or upstream, writes localStorage.
+   Both tarballs were decoded off the wire and dropped. **Still true for
+   IndexedDB.**
+2. `applyEnvelopeToSink` -- the path this sink does NOT take -- installs
+   the tarballs into `chromepaths.LocalStorageLevelDB()`, i.e. the
+   machine's **real** Chrome Default profile, not
+   `~/.agentcookie/chrome-profile` where `agent-browser` reads. **Still
+   true**; that function is for a universal-delivery sink.
+3. The CDP injector was cookies-only. **Fixed:** `cdp.local_storage: true`
+   turns on `internal/cdp.InstallLocalStorage`, which installs the synced
+   localStorage into the CDP profile per origin.
 
-So a site that keeps its session in localStorage (AdNova, Triple Whale)
-cannot ride this lane today no matter what the laptop sends.
+### The receiver, and why it is shaped the way it is
+
+`InstallLocalStorage` stages the tarball in a throwaway user-data-dir,
+launches one headless Chrome there to read each origin's items, then
+launches a second against the CDP profile and writes them back with
+`localStorage.setItem`. Both Chromes intercept every request through
+`Fetch.fulfillRequest` and serve an empty local document, so seeding an
+origin costs **no network request** -- the sink must not phone out to
+app.adnova.ai to write a storage area, and a site being down must not take
+its own localStorage install down with it.
+
+Four things are load-bearing, all measured rather than assumed:
+
+- **Navigation is required.** `DOMStorage.setDOMStorageItem` on an origin
+  with no loaded frame fails with `Frame not found for the given storage
+  id (-32000)`. Hence the intercept-and-navigate dance; it is not
+  ceremony.
+- **The close must be graceful.** localStorage lives in memory until
+  Chrome shuts down cleanly, exactly like the cookie store. Measured:
+  without `chromedp.Cancel`, a value written here reads back `null` on the
+  next open. The deferred context cancel SIGKILLs and loses the write.
+- **Never swap the directory.** `chromedirsync.AtomicReplaceDir` at this
+  profile is the one thing that must not happen.
+  `TestLiveInstallLocalStorage_RoundTripIsAdditiveAndHonorsBlocklist`
+  fails two ways when you try it: the reader's own accumulated origins are
+  destroyed (the profile is long-lived and never wiped), **and the
+  blocklist is bypassed entirely** -- a tarball carries every origin the
+  laptop had, so a whole-dir install has no place to filter. Per-origin
+  writes are the only shape that can honor the cookie policy.
+- **The blocklist is the same predicate as cookies.** mercury/google/
+  shopify/meta must not gain a localStorage side door; for a modern app
+  the localStorage token *is* the session. Origins whose host will not
+  parse are dropped, not allowed -- fail closed.
+
+Re-installing is skipped when the tarball is byte-identical to the last
+one (`sha256`, per-mux, in memory). This runs after every `/sync` (~30s),
+and localStorage changes far less often than cookies; without the check it
+would spend two Chrome spawns a minute rewriting the same bytes.
+
+**IndexedDB still goes nowhere** on this sink, and it only rides at all
+when the source sets `AGENTCOOKIE_SYNC_INDEXEDDB=1`. A `cdp_source`-mode
+source packs neither tarball by design.
+
+**Device-bound tokens (Triple Whale, OpenAI class) may not replay even
+once their localStorage is synced.** That is expected, not a bug -- those
+sites bind the session to more than storage.
 
 **The leveldb under `~/.agentcookie/chrome-profile/Default/Local Storage/`
-is not synced data.** It is written by the reader -- the Chrome for Testing
-that `agent-browser` launches -- and it accumulates from agent browsing
-sessions. Do not read an origin's presence there as proof the sync works;
-check `MANIFEST-*` vs the live `.ldb`/`.log` files before concluding
-anything (a `META:` key in MANIFEST alone only means the origin existed at
-some point).
+is not all synced data.** `agent-browser`'s Chrome for Testing writes its
+own there during agent sessions. Do not read an origin's presence as proof
+the sync works; and note a `META:` key in `MANIFEST-*` only means the
+origin existed at *some* point -- MANIFEST retains key boundaries for
+tables compacted away, which is why `originsInLevelDB` reads only `.ldb`
+and `.log`.
 
-The sink now logs, once per process, what the first envelope actually
-carried (`internal/cli/sink.go`, `firstEnvelopeLog`). Before that line
-existed the summary printed `+ 0 localStorage origins` on every sync, which
-was indistinguishable from "the source sent none" -- a silent failure that
-cost a full diagnosis pass.
+## The extra-profile cookie union is gated OFF here
 
-Closing the gap is additive-only work: `replaceLevelDBDir` does an
-`AtomicReplaceDir`, so pointing it at `~/.agentcookie/chrome-profile` would
-**wipe** the reader's accumulated localStorage and race `agent-browser` for
-the leveldb LOCK. Whatever lands here has to write per origin (CDP
-`DOMStorage.setDOMStorageItem`), never swap the directory.
+Upstream's `unionCookiesWithExtraProfiles` scans this Mac's own Chrome/
+Chromium/Brave/Edge/Dia roots and tries `getChromeDecryptKey` (a
+10s-timeout `security find-generic-password`) per browser, inside the
+`/sync` request handler. On a sink whose entire posture
+(`skip_chrome_sqlite: true`) exists to avoid Safe Storage, that is
+backwards: it is inert today only because the key reads fail, and if the
+keychain ever became readable, personal-browser cookies would flow into
+the synced set with no off switch.
+
+It is now gated on `!cfg.SkipChromeSQLite` -- the mode, not a new knob, so
+a normal universal-delivery sink is unaffected. Per-browser key failures
+are cached for the process (a restart re-probes), and a merge that
+actually happens is logged. The agentcookie CDP profile is excluded from
+the union: it is sealed under the automation mock-keychain key, not Safe
+Storage, so reading it with this machine's real Chrome key yields nothing
+-- and it is already the destination of the CDP write path.
+
+## Diagnostics: the log must not state a fact about a surface it never touched
+
+`sink.err.log` printed `+ 0 localStorage origins + 0 indexedDB origins` on
+every one of 89,839 syncs, on a path that writes no leveldb at all. It
+reads as "the source sent none" and it cost a full diagnosis pass aimed at
+the wrong machine. The rules now:
+
+- The skip path never prints a bare zero. It says what happened to the
+  payload: installed, `DISCARDED`, or `nothing to discard`.
+- `DISCARDED` is reserved for bytes that actually arrived and were
+  actually dropped. Claiming a discard when nothing was sent is the same
+  misdiagnosis pointing the other way.
+- The envelope-shape line logs **on change**, keyed by
+  (source, protocol version, ls present, idb present) -- not once per
+  process. Once-per-process freezes a possibly-wrong first answer for the
+  daemon's lifetime and misses a second source entirely.
+- The ok-line is the sink's reply body and the **source** prints it into
+  its own log, so it carries the same disposition -- otherwise the laptop
+  half stays blind.
+- The source logs the tarball sizes it packed, so "my capture is broken"
+  and "the sink dropped it" are distinguishable from either end.
 
 ## `delivery: degraded` is correct here -- do not "fix" it
 

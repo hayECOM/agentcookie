@@ -2,14 +2,17 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,10 +39,48 @@ var (
 	sinkDryRun bool
 )
 
-// firstEnvelopeLog gates the one-shot "what did the source actually
-// send" line in the skip_chrome_sqlite path. See its use in the /sync
-// handler.
-var firstEnvelopeLog sync.Once
+// leveldbSummary renders the leveldb half of the per-sync summary line.
+//
+// On the real-Chrome path these are genuine install counts. On the
+// skip_chrome_sqlite path no leveldb is written at all, and printing
+// "0 localStorage origins + 0 indexedDB origins" there states a fact
+// about a surface that was never touched -- it reads as "the source sent
+// nothing", which is exactly the misreading that sent a whole diagnosis
+// pass at the wrong machine. Say what happened to the payload instead.
+func leveldbSummary(cfg *config.SinkConfig, env *protocol.SyncEnvelope, result writeResult) string {
+	if !cfg.SkipChromeSQLite {
+		return fmt.Sprintf("%d localStorage origins + %d indexedDB origins", result.LocalStorage, result.IndexedDB)
+	}
+	if len(env.LocalStorageTarball) == 0 && len(env.IndexedDBTarball) == 0 {
+		return "no ls/idb payload (nothing to discard)"
+	}
+	if cfg.CDP.Enabled && cfg.CDP.LocalStorage && len(env.LocalStorageTarball) > 0 {
+		return "ls -> CDP profile, idb discarded (sidecar-only)"
+	}
+	return "ls/idb discarded (sidecar-only)"
+}
+
+// tarballDisposition names what the skip_chrome_sqlite path is about to
+// do with the envelope's leveldb payloads, in the words an operator
+// reading sink.err.log needs. "DISCARDED" is reserved for bytes that
+// actually arrived and are actually thrown away -- reporting a discard
+// when nothing was sent is the same misdiagnosis in the other direction.
+func tarballDisposition(cfg *config.SinkConfig, env *protocol.SyncEnvelope) string {
+	ls := len(env.LocalStorageTarball)
+	idb := len(env.IndexedDBTarball)
+	if ls == 0 && idb == 0 {
+		return "nothing to discard (source packed neither)"
+	}
+	installs := cfg.CDP.Enabled && cfg.CDP.LocalStorage && ls > 0
+	switch {
+	case installs && idb > 0:
+		return "localStorage -> CDP profile; indexedDB DISCARDED (no leveldb is written in skip_chrome_sqlite mode)"
+	case installs:
+		return "localStorage -> CDP profile (per-origin install)"
+	default:
+		return "DISCARDED (skip_chrome_sqlite mode writes no leveldb; set cdp.local_storage to install localStorage into the CDP profile)"
+	}
+}
 
 var sinkCmd = &cobra.Command{
 	Use:   "sink",
@@ -200,6 +241,14 @@ func newSinkMux(
 	sinkState *state.SinkState,
 	stateMu *sync.Mutex,
 ) *http.ServeMux {
+	// Per-mux, not package-scope: two sinks in one test process must not
+	// share a "have I logged this yet" latch or a last-installed digest.
+	var (
+		envelopeShapeMu        sync.Mutex
+		lastEnvelopeShape      string
+		lastLocalStorageDigest [sha256.Size]byte
+	)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintln(w, "ok")
@@ -258,11 +307,18 @@ func newSinkMux(
 			// Dump the accepted batch to stderr as JSON for inspection. Do NOT
 			// touch Chrome state.
 			dump, _ := json.MarshalIndent(map[string]any{
-				"source_hostname": envelope.SourceHostname,
-				"sequence":        envelope.Sequence,
-				"accepted":        len(cookies),
-				"dropped":         dropped,
-				"cookies":         cookies,
+				"source_hostname":  envelope.SourceHostname,
+				"protocol_version": envelope.ProtocolVersion,
+				"sequence":         envelope.Sequence,
+				"accepted":         len(cookies),
+				"dropped":          dropped,
+				// Sizes, never contents: these tarballs are whole Chrome
+				// storage dirs full of live session tokens. A dry-run is
+				// for checking the wire format, and "did localStorage
+				// ride?" is the question this dump could not answer.
+				"local_storage_tarball_bytes": len(envelope.LocalStorageTarball),
+				"indexed_db_tarball_bytes":    len(envelope.IndexedDBTarball),
+				"cookies":                     cookies,
 			}, "", "  ")
 			fmt.Fprintf(os.Stderr, "agentcookie sink (dry-run): accepted batch:\n%s\n", string(dump))
 			stateMu.Lock()
@@ -289,23 +345,42 @@ func newSinkMux(
 			// (PP CLIs read them via sidecar / adapter session files).
 			result, writeErr = applySidecarOnlyToSink(cookies)
 			writeMode = "sidecar+adapter"
-			// A v2 source packs localStorage/IndexedDB into every
-			// envelope, and this path drops both on the floor. The
-			// summary line below then reports "0 localStorage origins",
-			// which reads as "the source sent none" -- indistinguishable
-			// from "the source sent 12MB and we discarded it". Report
-			// which one it is, once per sink process, so a site that
-			// keeps its session in localStorage (AdNova, Triple Whale)
-			// can be diagnosed from the sink log instead of by reading
-			// this function. Once per process, not once per sync: the
-			// answer only changes when the source changes, and this log
-			// is unrotated.
-			firstEnvelopeLog.Do(func() {
+			// A v2 source packs localStorage into every envelope, but
+			// not unconditionally: IndexedDB rides only under
+			// AGENTCOOKIE_SYNC_INDEXEDDB=1, and a cdp_source-mode
+			// source carries cookies only and packs neither. This path
+			// writes no leveldb, so what does arrive is either handed to
+			// the per-origin installer below or dropped. The
+			// summary line then reports "0 localStorage origins", which
+			// reads as "the source sent none" -- indistinguishable from
+			// "the source sent 12MB and we discarded it". Say which.
+			//
+			// Logged on CHANGE, not once per process: a first envelope
+			// that hit a transient pack failure would otherwise freeze a
+			// "0 bytes" answer for the daemon's lifetime while every
+			// later envelope carried megabytes, and a source that STOPS
+			// sending would keep the stale sizes on the record. Keyed by
+			// the shape rather than the exact byte counts, so a
+			// localStorage store that grows by a few bytes each sync
+			// does not reopen the log -- output stays bounded by the
+			// number of distinct source/shape combinations, which is one
+			// in steady state.
+			shape := fmt.Sprintf("%s|v%d|ls=%t|idb=%t",
+				envelope.SourceHostname, envelope.ProtocolVersion,
+				len(envelope.LocalStorageTarball) > 0, len(envelope.IndexedDBTarball) > 0)
+			envelopeShapeMu.Lock()
+			changed := shape != lastEnvelopeShape
+			if changed {
+				lastEnvelopeShape = shape
+			}
+			envelopeShapeMu.Unlock()
+			if changed {
 				fmt.Fprintf(os.Stderr,
-					"agentcookie sink: first envelope from %s: protocol v%d, localStorage %d bytes, indexedDB %d bytes -- DISCARDED (skip_chrome_sqlite mode installs no leveldb)\n",
+					"agentcookie sink: envelope from %s: protocol v%d, localStorage %d bytes, indexedDB %d bytes -- %s\n",
 					envelope.SourceHostname, envelope.ProtocolVersion,
-					len(envelope.LocalStorageTarball), len(envelope.IndexedDBTarball))
-			})
+					len(envelope.LocalStorageTarball), len(envelope.IndexedDBTarball),
+					tarballDisposition(cfg, &envelope))
+			}
 		} else {
 			result, writeErr = applyEnvelopeToSink(r.Context(), cfg, &envelope, cookies, key)
 			writeMode = "sqlite+leveldb"
@@ -316,7 +391,7 @@ func newSinkMux(
 			http.Error(w, fmt.Sprintf("apply envelope: %v", writeErr), http.StatusInternalServerError)
 			return
 		}
-		fmt.Fprintf(os.Stderr, "agentcookie sink: wrote %d cookies (+ %d sidecar) + %d localStorage origins + %d indexedDB origins (mode=%s, dropped %d %s cookies)\n", result.Cookies, result.SidecarCookies, result.LocalStorage, result.IndexedDB, writeMode, dropped, blockMatcher.DropLabel())
+		fmt.Fprintf(os.Stderr, "agentcookie sink: wrote %d cookies (+ %d sidecar) + %s (mode=%s, dropped %d %s cookies)\n", result.Cookies, result.SidecarCookies, leveldbSummary(cfg, &envelope, result), writeMode, dropped, blockMatcher.DropLabel())
 
 		// v0.12.0-beta.3: when CDP injection is enabled, spawn a
 		// one-shot headless Chrome and push the cookies via
@@ -326,16 +401,40 @@ func newSinkMux(
 		// fail the /sync response -- the sidecar write already
 		// succeeded above, so PP CLIs are still served.
 		var cdpWriteMode string
+		var localStorageNote string
+		cdpProfileDir := cfg.CDP.ProfileDir
+		if cdpProfileDir == "" {
+			cdpProfileDir = "~/.agentcookie/chrome-profile"
+		}
 		if cfg.CDP.Enabled && len(cookies) > 0 {
-			profileDir := cfg.CDP.ProfileDir
-			if profileDir == "" {
-				profileDir = "~/.agentcookie/chrome-profile"
-			}
+			profileDir := cdpProfileDir
 			if cdpErr := cdpInject(r.Context(), profileDir, cookies); cdpErr != nil {
 				fmt.Fprintf(os.Stderr, "agentcookie sink: CDP injection failed (sidecar write succeeded, PP CLIs unaffected): %v\n", cdpErr)
 			} else {
 				fmt.Fprintf(os.Stderr, "agentcookie sink: CDP injection pushed %d cookies into %s\n", len(cookies), profileDir)
 				cdpWriteMode = "+cdp"
+			}
+		}
+
+		// Sites that keep their session in localStorage rather than
+		// cookies (AdNova, Triple Whale) ride this. Opt-in via
+		// cdp.local_storage; installed per origin, additively, so the
+		// reader's own accumulated origins survive. Skipped when the
+		// tarball is byte-identical to the last one installed: this runs
+		// after every /sync (~30s here) and localStorage changes far less
+		// often than cookies, so re-running it would spend two Chrome
+		// spawns a minute to rewrite the same bytes.
+		if cfg.CDP.Enabled && cfg.CDP.LocalStorage && len(envelope.LocalStorageTarball) > 0 {
+			digest := sha256.Sum256(envelope.LocalStorageTarball)
+			if digest == lastLocalStorageDigest {
+				localStorageNote = "unchanged"
+			} else if lsResult, lsErr := cdpInstallLocalStorage(r.Context(), cdpProfileDir, envelope.LocalStorageTarball, blockMatcher.ShouldSyncHost); lsErr != nil {
+				localStorageNote = "FAILED"
+				fmt.Fprintf(os.Stderr, "agentcookie sink: localStorage install failed (cookies unaffected): %v\n", lsErr)
+			} else {
+				lastLocalStorageDigest = digest
+				localStorageNote = fmt.Sprintf("%d origins", lsResult.OriginsInstalled)
+				fmt.Fprintf(os.Stderr, "agentcookie sink: localStorage install: %s\n", lsResult.Summary())
 			}
 		}
 
@@ -382,7 +481,24 @@ func newSinkMux(
 		if cfg.CDP.ProfileDir != "" {
 			profileDir = cfg.CDP.ProfileDir
 		}
-		unionedCookies := unionCookiesWithExtraProfiles(cookies, profileDir, blockMatcher)
+		// The extra-profile union reads this machine's OWN browsers
+		// (Chrome/Chromium/Brave/Edge/Dia) through Chrome Safe Storage.
+		// A skip_chrome_sqlite sink exists precisely to never touch Safe
+		// Storage -- that posture is why this Mac mini can run headless
+		// with no GUI session to answer a Keychain prompt. Running the
+		// union there contradicts the mode it is configured in: it costs
+		// a `security find-generic-password` per browser inside the
+		// request handler, and if the keychain ever became readable it
+		// would silently merge personal-browser cookies into the synced
+		// set with no off switch. Gate on the mode rather than adding a
+		// knob -- a normal (universal-delivery) sink is unaffected.
+		unionedCookies := cookies
+		if !cfg.SkipChromeSQLite {
+			unionedCookies = unionExtraProfiles(cookies, profileDir, blockMatcher)
+			if extra := len(unionedCookies) - len(cookies); extra > 0 {
+				fmt.Fprintf(os.Stderr, "agentcookie sink: merged %d cookie(s) from this machine's other Chrome profiles into the adapter set\n", extra)
+			}
+		}
 		if len(unionedCookies) > 0 {
 			adapterResults = sinkpush.RunAll(unionedCookies)
 			logAdapterResults(adapterResults)
@@ -445,8 +561,17 @@ func newSinkMux(
 		// operators don't mistake "wrote 0 cookies" for a failure (Linux
 		// skips SQLite and injects via live CDP; the sidecar+livecdp path
 		// is the real delivery).
-		okLine := fmt.Sprintf("ok: wrote %d cookies (%d sidecar), %d localStorage origins, %d indexedDB origins; dropped %d %s cookies",
-			result.Cookies, result.SidecarCookies, result.LocalStorage, result.IndexedDB, dropped, blockMatcher.DropLabel())
+		// This line is the sink's reply body, and the source prints it
+		// verbatim into ITS log -- for the laptop half of this pair it is
+		// the only visibility into what the mini did with the payload.
+		// Carrying the same leveldb disposition as the local summary
+		// means a source-side operator is not left reading "0
+		// localStorage origins" and concluding their capture is broken.
+		okLine := fmt.Sprintf("ok: wrote %d cookies (%d sidecar), %s; dropped %d %s cookies",
+			result.Cookies, result.SidecarCookies, leveldbSummary(cfg, &envelope, result), dropped, blockMatcher.DropLabel())
+		if localStorageNote != "" {
+			okLine += "; localStorage install: " + localStorageNote
+		}
 		if cfg.LiveCDP.Enabled {
 			endpoint := liveCDPEndpoint
 			if endpoint == "" {
@@ -548,6 +673,34 @@ func SetCDPInjectorForTesting(f func(ctx context.Context, profileDir string, coo
 	prev := cdpInject
 	cdpInject = f
 	return func() { cdpInject = prev }
+}
+
+// unionExtraProfiles is the indirection seam for the extra-profile
+// cookie union, so a test can observe whether the skip_chrome_sqlite
+// gate actually kept it from running. The real implementation reaches
+// for this machine's Keychain, which a unit test must not do.
+var unionExtraProfiles = unionCookiesWithExtraProfiles
+
+// SetExtraProfileUnionForTesting replaces unionExtraProfiles and returns
+// a restore func. Test-only seam.
+func SetExtraProfileUnionForTesting(f func([]chrome.Cookie, string, *protocol.BlocklistMatcher) []chrome.Cookie) func() {
+	prev := unionExtraProfiles
+	unionExtraProfiles = f
+	return func() { unionExtraProfiles = prev }
+}
+
+// cdpInstallLocalStorage is the indirection seam for the per-origin
+// localStorage receiver, matching cdpInject above.
+var cdpInstallLocalStorage = func(ctx context.Context, profileDir string, tarball []byte, allowHost func(string) bool) (cdp.LocalStorageResult, error) {
+	return cdp.InstallLocalStorage(ctx, profileDir, tarball, allowHost)
+}
+
+// SetLocalStorageInstallerForTesting replaces cdpInstallLocalStorage and
+// returns a restore func. Test-only seam.
+func SetLocalStorageInstallerForTesting(f func(ctx context.Context, profileDir string, tarball []byte, allowHost func(string) bool) (cdp.LocalStorageResult, error)) func() {
+	prev := cdpInstallLocalStorage
+	cdpInstallLocalStorage = f
+	return func() { cdpInstallLocalStorage = prev }
 }
 
 // writeCookiesSidecar writes the plaintext cookies sidecar at
@@ -712,9 +865,28 @@ func unionCookiesWithExtraProfiles(envelopeCookies []chrome.Cookie, profileDir s
 	// Discover extra Chrome profiles on this machine.
 	discovery := chromepaths.DiscoverForConfig(profileDir)
 
+	// The agentcookie CDP profile is discovered here too, but it is NOT a
+	// Safe Storage store: the injector seals it under the automation
+	// mock-keychain key (see internal/cdp/allocator.go). Reading it with
+	// this machine's real Chrome key yields rows that fail to decrypt, so
+	// it contributes nothing and only costs a SQLite open per sync. It is
+	// also already the destination of the CDP write path -- merging it
+	// back into the source set would be circular.
+	agentcookieProfile := ""
+	if profileDir != "" {
+		if abs, err := filepath.Abs(expandTildePath(profileDir)); err == nil {
+			agentcookieProfile = abs
+		}
+	}
+
 	// Group stores by browser to reuse decryption keys.
 	browserStores := make(map[string][]chromepaths.Store)
 	for _, store := range discovery.Stores {
+		if agentcookieProfile != "" {
+			if store.Root == agentcookieProfile || filepath.Join(store.Root, store.Profile) == agentcookieProfile {
+				continue
+			}
+		}
 		browserStores[store.Browser] = append(browserStores[store.Browser], store)
 	}
 
@@ -740,9 +912,18 @@ func unionCookiesWithExtraProfiles(envelopeCookies []chrome.Cookie, profileDir s
 			return stores[i].CookiesPath < stores[j].CookiesPath
 		})
 
+		if keyLookupFailedBefore(browserName) {
+			// Already proved unreadable this process. Retrying costs a
+			// 10s-timeout `security find-generic-password` per browser
+			// per sync, inside the request handler; on a locked or
+			// prompt-gated keychain that is the difference between a
+			// 200ms sync and a ~40s one. A sink restart re-probes.
+			continue
+		}
 		key, err := getChromeDecryptKey(browserName)
 		if err != nil {
 			// Can't decrypt this browser's cookies - skip all its stores.
+			rememberKeyLookupFailure(browserName, err)
 			continue
 		}
 
@@ -787,6 +968,39 @@ func unionCookiesWithExtraProfiles(envelopeCookies []chrome.Cookie, profileDir s
 // to avoid dropping path-scoped twins (e.g., "/" vs "/api" on same host+name).
 func cookieDedupeKey(c chrome.Cookie) string {
 	return c.HostKey + "\x00" + c.Name + "\x00" + c.Path
+}
+
+// keyLookupFailures remembers which browsers proved to have no readable
+// Safe Storage key, so the union does not re-probe the Keychain on every
+// /sync. Failures only: a successful key is re-derived per sync rather
+// than cached in memory for the daemon's lifetime.
+var keyLookupFailures sync.Map // browserName -> struct{}
+
+func keyLookupFailedBefore(browserName string) bool {
+	_, seen := keyLookupFailures.Load(browserName)
+	return seen
+}
+
+func rememberKeyLookupFailure(browserName string, err error) {
+	if _, loaded := keyLookupFailures.LoadOrStore(browserName, struct{}{}); !loaded {
+		fmt.Fprintf(os.Stderr, "agentcookie sink: no readable Safe Storage key for %q (%v); skipping its profiles until restart\n", browserName, err)
+	}
+}
+
+// expandTildePath expands a leading ~ to the user's home dir. Config
+// paths are written with ~ by the wizard; filepath.Abs treats it as a
+// literal directory name.
+func expandTildePath(p string) string {
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			if p == "~" {
+				return home
+			}
+			return filepath.Join(home, p[2:])
+		}
+	}
+	return p
 }
 
 // maybeRebindListenAddr checks if the configured listen address IP is currently

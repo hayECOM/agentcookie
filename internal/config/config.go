@@ -110,6 +110,18 @@ type CmuxRef struct {
 type CDPRef struct {
 	Enabled    bool   `yaml:"enabled" json:"enabled"`
 	ProfileDir string `yaml:"profile_dir,omitempty" json:"profile_dir,omitempty"`
+	// LocalStorage opts the CDP profile into receiving the envelope's
+	// synced localStorage, installed per origin through
+	// DOMStorage/Runtime rather than by replacing the profile's leveldb
+	// directory (see internal/cdp.InstallLocalStorage for why the
+	// directory swap is not an option at this path).
+	//
+	// Off by default and omitempty: a sink.yaml written before this
+	// field keeps the cookies-only behavior, and the new writer cannot
+	// destabilize the cookie path on an install that did not ask for
+	// it. Sites that keep their session in localStorage rather than
+	// cookies (AdNova, Triple Whale) need this on to ride the sync.
+	LocalStorage bool `yaml:"local_storage,omitempty" json:"local_storage,omitempty"`
 }
 
 // LiveCDPRef configures the Linux sink's attach-to-existing-Chrome CDP

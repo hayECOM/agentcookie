@@ -572,7 +572,7 @@ func pushOnce(
 			r.Err = postErr
 		} else {
 			r.Count = len(all)
-			humanLines = append(humanLines, fmt.Sprintf("agentcookie source: [%s] posted %d cookies, sink replied: %s%s", sink.URL, len(all), reply, dbscNote(dbsc)))
+			humanLines = append(humanLines, fmt.Sprintf("agentcookie source: [%s] posted %d cookies%s, sink replied: %s%s", sink.URL, len(all), tarballNote(lsTarball, idbTarball), reply, dbscNote(dbsc)))
 		}
 		if r.Err != nil {
 			humanLines = append(humanLines, fmt.Sprintf("agentcookie source: [%s] push failed: %v", sink.URL, r.Err))
@@ -587,8 +587,31 @@ func pushOnce(
 
 	result["sinks"] = sinkReports
 	result["posted"] = len(results) > 0 && len(aggregateFailedLabels(results)) == 0
+	// Sizes, never contents. Without these the source half of the pair is
+	// blind to whether it packed anything at all: a localStorage pack that
+	// silently found nothing looks identical, from here, to one that
+	// shipped 12MB.
+	result["local_storage_tarball_bytes"] = len(lsTarball)
+	result["indexed_db_tarball_bytes"] = len(idbTarball)
 	_ = emit(result, strings.Join(humanLines, "\n")+"\n")
 	return results, dbsc, nil
+}
+
+// tarballNote renders what this push packed alongside the cookies, for
+// the source's own log. Silence when neither rode: a cdp_source-mode
+// source carries cookies only by design, and annotating every one of its
+// pushes with "+0 bytes" would be noise rather than news.
+func tarballNote(lsTarball, idbTarball []byte) string {
+	switch {
+	case len(lsTarball) > 0 && len(idbTarball) > 0:
+		return fmt.Sprintf(" + %d bytes localStorage + %d bytes indexedDB", len(lsTarball), len(idbTarball))
+	case len(lsTarball) > 0:
+		return fmt.Sprintf(" + %d bytes localStorage", len(lsTarball))
+	case len(idbTarball) > 0:
+		return fmt.Sprintf(" + %d bytes indexedDB", len(idbTarball))
+	default:
+		return ""
+	}
 }
 
 // aggregateFailedLabels returns the URLs of sinks whose push failed.
