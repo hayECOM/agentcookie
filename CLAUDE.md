@@ -133,6 +133,59 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.agentcookie.sink.pli
 Cookies only flush to SQLite on a clean browser shutdown, so always
 `agent-browser close --all` before the post-launch read.
 
+## localStorage / IndexedDB do NOT reach this sink (as of 2026-09-18)
+
+Upstream has carried localStorage + IndexedDB sync since v0.7 (protocol v2,
+`LocalStorageTarball` / `IndexedDBTarball`). **None of it lands on this
+machine**, and the reason is this sink's own config, not the laptop source:
+
+1. `skip_chrome_sqlite: true` routes every `/sync` through
+   `applySidecarOnlyToSink`, which writes the cookie sidecar and returns.
+   Both tarballs are decoded off the wire and then dropped on the floor.
+2. Even with that flag off, `applyEnvelopeToSink` installs the tarballs into
+   `chromepaths.LocalStorageLevelDB()` -- the machine's **real** Chrome
+   Default profile -- not into `~/.agentcookie/chrome-profile`, which is the
+   profile `agent-browser` actually reads.
+3. The CDP injector is cookies-only (`Network.setCookies`). Nothing in
+   `internal/cdp`, locally or upstream, writes localStorage.
+
+So a site that keeps its session in localStorage (AdNova, Triple Whale)
+cannot ride this lane today no matter what the laptop sends.
+
+**The leveldb under `~/.agentcookie/chrome-profile/Default/Local Storage/`
+is not synced data.** It is written by the reader -- the Chrome for Testing
+that `agent-browser` launches -- and it accumulates from agent browsing
+sessions. Do not read an origin's presence there as proof the sync works;
+check `MANIFEST-*` vs the live `.ldb`/`.log` files before concluding
+anything (a `META:` key in MANIFEST alone only means the origin existed at
+some point).
+
+The sink now logs, once per process, what the first envelope actually
+carried (`internal/cli/sink.go`, `firstEnvelopeLog`). Before that line
+existed the summary printed `+ 0 localStorage origins` on every sync, which
+was indistinguishable from "the source sent none" -- a silent failure that
+cost a full diagnosis pass.
+
+Closing the gap is additive-only work: `replaceLevelDBDir` does an
+`AtomicReplaceDir`, so pointing it at `~/.agentcookie/chrome-profile` would
+**wipe** the reader's accumulated localStorage and race `agent-browser` for
+the leveldb LOCK. Whatever lands here has to write per origin (CDP
+`DOMStorage.setDOMStorageItem`), never swap the directory.
+
+## `delivery: degraded` is correct here -- do not "fix" it
+
+`delivery` in `sink.yaml` is a **descriptive marker only**: the wizard
+records which install shape was chosen and `doctor` reads it back
+(`internal/cli/doctor.go`). Nothing branches on it. `degraded` is the
+truthful label for this machine -- doctor renders it as "writes a separate
+profile; only agentcookie-aware tools work", which is exactly the intended
+design (sidecar + `~/.agentcookie/chrome-profile`, real Chrome untouched).
+
+Setting it to `universal` would not restore anything. Universal delivery
+means writing the machine's real Chrome profile, which needs a Chrome Safe
+Storage Keychain prompt that a headless mini has no GUI session to answer --
+the reason `skip_chrome_sqlite` was set in the first place.
+
 ## Known rough edges (not fixed)
 
 - `sink.err.log` is unrotated and was ~44 MB as of 2026-08-13.

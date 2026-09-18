@@ -36,6 +36,11 @@ var (
 	sinkDryRun bool
 )
 
+// firstEnvelopeLog gates the one-shot "what did the source actually
+// send" line in the skip_chrome_sqlite path. See its use in the /sync
+// handler.
+var firstEnvelopeLog sync.Once
+
 var sinkCmd = &cobra.Command{
 	Use:   "sink",
 	Short: "Listen for incoming cookie syncs and upsert them into local Chrome",
@@ -284,6 +289,23 @@ func newSinkMux(
 			// (PP CLIs read them via sidecar / adapter session files).
 			result, writeErr = applySidecarOnlyToSink(cookies)
 			writeMode = "sidecar+adapter"
+			// A v2 source packs localStorage/IndexedDB into every
+			// envelope, and this path drops both on the floor. The
+			// summary line below then reports "0 localStorage origins",
+			// which reads as "the source sent none" -- indistinguishable
+			// from "the source sent 12MB and we discarded it". Report
+			// which one it is, once per sink process, so a site that
+			// keeps its session in localStorage (AdNova, Triple Whale)
+			// can be diagnosed from the sink log instead of by reading
+			// this function. Once per process, not once per sync: the
+			// answer only changes when the source changes, and this log
+			// is unrotated.
+			firstEnvelopeLog.Do(func() {
+				fmt.Fprintf(os.Stderr,
+					"agentcookie sink: first envelope from %s: protocol v%d, localStorage %d bytes, indexedDB %d bytes -- DISCARDED (skip_chrome_sqlite mode installs no leveldb)\n",
+					envelope.SourceHostname, envelope.ProtocolVersion,
+					len(envelope.LocalStorageTarball), len(envelope.IndexedDBTarball))
+			})
 		} else {
 			result, writeErr = applyEnvelopeToSink(r.Context(), cfg, &envelope, cookies, key)
 			writeMode = "sqlite+leveldb"
