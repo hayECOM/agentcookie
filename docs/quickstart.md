@@ -27,7 +27,7 @@ cp agentcookie/examples/blocklist.yaml ~/.config/agentcookie/blocklist.yaml
 ```
 
 Edit `source.yaml`:
-- `sink.url`: the sink's tailnet URL, e.g. `http://my-mac-mini.tailnet.ts.net:9999/sync`
+- `sink.url`: the sink's tailnet URL. **Use a hostname** (e.g., `http://my-mac-mini.tailnet.ts.net:9999/sync` or the short MagicDNS name `http://my-mac-mini:9999/sync`) rather than a frozen 100.x IP. The source resolves the hostname via `tailscale status --json` at sync time, preferring Online peers, so sync keeps working after the sink's Tailscale re-auth assigns a new IP.
 - `peer.hostname`: the sink's tailnet hostname
 
 Edit `blocklist.yaml` or run `agentcookie accounts off <domain>` for sites you do not want to sync. Empty blocklist means sync everything. For a stricter agent-runtime setup, set `policy: allowlist` in `blocklist.yaml` and list only the exact hosts/subdomains you want to sync; all other cookie hosts are dropped on both source and sink.
@@ -40,7 +40,7 @@ cp agentcookie/examples/blocklist.yaml ~/.config/agentcookie/blocklist.yaml
 ```
 
 Edit `sink.yaml`:
-- `listen.addr`: the sink's tailnet IP + port, e.g. `100.x.y.z:9999`
+- `listen.addr`: the sink's current tailnet IP + port, e.g. `100.x.y.z:9999`. After Tailscale re-auth, if this IP becomes stale, the sink auto-rebinds to the new 100.x address on startup.
 - `peer.hostname`: the source's tailnet hostname
 - `cdp.enabled: true` if you want cookies to land in a running Chrome immediately (recommended)
 
@@ -117,15 +117,13 @@ Check on the sink: open Chrome (or use the running one), visit a synced site, yo
 
 ## Step 6: Make it continuous
 
-For now, `agentcookie source --once` is a single shot. Wire it to your preferred trigger (cron, launchd, fswatch on Chrome's Cookies file). Long-lived fsnotify-driven watch mode is on the roadmap.
-
-A reasonable cron:
-
 ```
-*/5 * * * * /path/to/agentcookie source --once >> ~/.agentcookie/source-cron.log 2>&1
+agentcookie source --watch
 ```
 
-Five-minute resolution is fine for most sites; session tokens generally rotate on the order of hours.
+This is the long-running mode: fsnotify watches Chrome's Cookies SQLite file for write events, debounces 500ms, and pushes to the sink. The first change pushes right away; after that, pushes are rate-capped at one every 30 seconds even under continuous Chrome activity. Keep it running the same way you kept the sink running in Step 4 (a LaunchAgent plist, or interactively while testing).
+
+`agentcookie source --once` is still there as a one-shot alternative: a single read+push cycle, useful for cron, CI, or a manual sync check.
 
 ## Step 7: Device-bound sessions (DBSC)
 

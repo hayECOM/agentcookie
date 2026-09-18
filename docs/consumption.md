@@ -98,7 +98,7 @@ emits; the alias above is the operator-set bridge until then.
 Per-app push adapters (`internal/sinkpush`) remain as a legacy fallback; the
 read commands above are the supported, generic consumption path.
 
-## Linux consumption (v0.14+)
+## Linux consumption (v1.0+)
 
 On Linux, agentcookie runs as a continuous `/sync` sink over Tailscale, just
 like macOS. The key difference: it injects cookies directly into a running
@@ -109,41 +109,74 @@ Chrome via CDP instead of writing Chrome's SQLite.
 1. **Join the tailnet**: The Linux sink MUST have a Tailscale 100.x address.
    Verify with `tailscale status`. The sink will refuse to start without it.
 
-2. **Pair with the source Mac**:
+2. **Write sink.yaml and blocklist.yaml**: Do NOT run `wizard install --as sink`
+   on Linux (it omits the policy file, which means allowlist-empty / ship nothing).
+   Write the YAML files directly as shown in the README.
+
+3. **Pair with the source Mac**:
    ```bash
    # On Mac (source):
-   agentcookie pair --as source
+   agentcookie wizard install --as source --peer <linux-tailscale-hostname>
+   # The wizard prints a pairing code and URL
 
    # On Linux (sink):
    agentcookie pair --as sink --peer <mac-hostname> \
      --pair-url http://<mac-hostname>:9998/pair --code <code>
    ```
 
-3. **Start Chrome with CDP enabled**:
+4. **Start Chrome with CDP enabled**:
    ```bash
    google-chrome --remote-debugging-port=9223 &
    ```
 
-4. **Start the sink** (binds to your tailnet IP):
+5. **Start the sink** (binds to your tailnet IP):
    ```bash
    agentcookie sink
    ```
 
-5. **Cookies sync continuously**. Whenever the source Mac's Chrome cookies
+6. **Cookies sync continuously**. Whenever the source Mac's Chrome cookies
    change, they're pushed to the Linux sink and injected via CDP. Any page
    Chrome loads (including agent-driven pages via Playwright, Puppeteer, or
    browser-use) sees the logged-in session.
 
+### Verifying success on Linux
+
+The sidecar (`~/.agentcookie/cookies-plain.db`) and `agentcookie cookies --domain`
+DO work on Linux but are NOT the success metric. The sidecar is plaintext at rest.
+
+Success is the live CDP inject. Verify with:
+
+```bash
+agentcookie status --json
+# Look for LastWriteMode containing "livecdp"
+
+agentcookie doctor
+# Look for "live_cdp: endpoint reachable" OK
+# Look for "live_cdp: injected N cookies into M context(s)" in sync output
+```
+
+The message `wrote 0 cookies` for Chrome SQLite is expected on Linux.
+
+Do NOT use `agentcookie cookies --json` as a verify step - it reads the plaintext
+sidecar, which is not the success path.
+
 ### Linux cookie policy
 
 Missing `blocklist.yaml` or an omitted `policy` field defaults to **allowlist-
-empty** on Linux (ship nothing). This is security-by-default: an untrusted
-Linux sink must explicitly opt domains into sync.
+empty** on Linux (ship nothing). This is security-by-default.
 
-Configure which domains sync:
+For a single-operator trusted box (like your own Grok Bot VM), write:
 
 ```yaml
 # ~/.config/agentcookie/blocklist.yaml
+version: 1
+policy: blocklist
+domains: []
+```
+
+This syncs all cookies. For multi-user or less-trusted sinks, use allowlist mode:
+
+```yaml
 version: 1
 policy: allowlist
 domains:
@@ -166,13 +199,13 @@ agentcookie sink
 # Grok Bot's browser now syncs continuously with your Mac's sessions
 ```
 
-### What's NOT available on Linux
+### Secrets bus on Linux
 
-- Plaintext sidecar (`~/.agentcookie/cookies-plain.db`) — not written
-- Per-CLI push adapters — not triggered (no sidecar to read)
-- `agentcookie cookies --domain` — reads the sidecar, which doesn't exist
-- File-based import — not the supported path; use Tailscale `/sync`
+Per-CLI secrets sync to `~/.agentcookie/secrets/<cli>/` and work on Linux the
+same as macOS. Use `agentcookie secret env <cli>` to emit shell-assignable lines.
 
-The Linux sink is designed for agent runtimes where the only consumer is a
-browser driven by the agent. For CLIs that need the sidecar or adapters, use
-a macOS sink.
+### Per-CLI adapters on Linux
+
+Per-CLI push adapters run on Linux when the sidecar is present. However, the
+primary consumption path on Linux is the browser via CDP. CLIs that need
+specific session files can read the sidecar or secrets bus directly.

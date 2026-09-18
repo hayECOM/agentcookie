@@ -16,13 +16,21 @@ Firefox and Safari have different cookie stores entirely; supporting them is rea
 
 ## What about Linux sinks?
 
-**Fully supported via Tailscale `/sync` (v0.14+).** The Linux receive path is the same continuous sync as macOS-to-macOS, but skips Chrome SQLite entirely (no Keychain, no libsecret) and instead injects cookies into a running Chrome via CDP.
+**Fully supported via Tailscale `/sync` (v1.0+).** The Linux receive path is the same continuous sync as macOS-to-macOS, but skips Chrome SQLite entirely (no Keychain, no libsecret) and instead injects cookies into a running Chrome via CDP.
 
-The sink receives the AES-GCM-sealed envelope over Tailscale, decrypts with the pairing-derived key, filters by the sink's allowlist, and injects via CDP's `Storage.setCookies` into every browser context. The target Chrome must be running with `--remote-debugging-port` (default 9223). This is the Grok Bot / agent-runtime path: the Linux box wakes up logged into source-allowlisted sites without a second login.
+The sink receives the AES-GCM-sealed envelope over Tailscale, decrypts with the pairing-derived key, filters by the sink's policy, and injects via CDP's `Storage.setCookies` into every browser context. The target Chrome must be running with `--remote-debugging-port` (default 9223). This is the Grok Bot / agent-runtime path: the Linux box wakes up logged into your sites without a second login.
 
-**Tailscale required**: The Linux sink MUST bind a Tailscale 100.x address. It will refuse to start without a working tailnet connection. Run `tailscale status` to verify connectivity. Plaintext cookie JSON file transfers are NOT the supported Linux path — the tailnet (pairing + AES-GCM envelope + 100.x bind) is the trust boundary.
+**Tailscale required**: The Linux sink MUST bind a Tailscale 100.x address. It will refuse to start without a working tailnet connection. Run `tailscale status` to verify connectivity. Plaintext cookie JSON file transfers are NOT the supported Linux path - the tailnet (pairing + AES-GCM envelope + 100.x bind) is the trust boundary.
 
-**Security**: Missing policy on Linux defaults to allowlist-empty (ship nothing). You must explicitly configure which domains sync via `blocklist.yaml` with `policy: allowlist` and the domains you want.
+**Security**: Missing policy on Linux defaults to allowlist-empty (ship nothing). For a single-operator trusted box (like your own Grok Bot VM), write `blocklist.yaml` with `policy: blocklist` and `domains: []` to sync all cookies:
+
+```yaml
+version: 1
+policy: blocklist
+domains: []
+```
+
+The 1.0 release does NOT change this default in code. A later release may flip the default, which would be a breaking change.
 
 ## Will syncing cookies log me out of sites on the source machine?
 
@@ -79,12 +87,14 @@ After pairing once, delete the `security.shared_secret` field from both YAMLs. T
 
 ## Can I run this in a Docker container on a cloud VM?
 
-The sink can run anywhere Chrome stable runs (when CDP is enabled and Chrome is reachable) OR anywhere you can mount the destination's Chrome Cookies SQLite (when only the SQLite path is used). On Linux that means the v0.2 Linux sink work needs to land first. On macOS-in-the-cloud (e.g. MacStadium), it works today as long as you can SSH in and the tailnet reaches the host.
+Yes. The sink can run anywhere Chrome stable runs and the tailnet reaches. On Linux, the sink injects cookies via CDP into a running Chrome - no SQLite write, no Keychain. Start Chrome with `--remote-debugging-port=9223` and configure `live_cdp.endpoint` in sink.yaml. The sink must bind a Tailscale 100.x address; run `tailscale status` to verify connectivity.
+
+On macOS-in-the-cloud (e.g. MacStadium), the full macOS sink path works as long as you can SSH in and the tailnet reaches the host.
 
 ## Is this open source?
 
-Apache 2.0. PRs welcome. See the repo at https://github.com/mvanhorn/agentcookie.
+MIT. PRs welcome. See the repo at https://github.com/mvanhorn/agentcookie.
 
 ## How do I report a security issue?
 
-Open an issue, or for sensitive findings, email the maintainer directly. There's no bug bounty yet; that's not v0.1 territory.
+Open an issue at https://github.com/mvanhorn/agentcookie/issues, or for sensitive findings, send a direct message to the maintainer on X at https://x.com/mvanhorn. There's no bug bounty yet; that's not v0.1 territory.

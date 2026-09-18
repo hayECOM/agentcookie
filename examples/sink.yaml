@@ -1,35 +1,54 @@
-# Example sink.yaml. Copy to ~/.config/agentcookie/sink.yaml on the machine
-# where your AI agents run (your Mac mini, cloud VM, etc.).
+# Example sink.yaml for Linux sinks (Grok Bot, cloud VM, etc.)
+# Copy to ~/.config/agentcookie/sink.yaml
+
+# IMPORTANT: Also create blocklist.yaml for the cookie policy.
+# On Linux, omitted policy = allowlist-empty (ship nothing).
+# See examples/blocklist.yaml for the sync-all configuration.
 
 listen:
-  # Address the sink's /sync HTTP listener binds to. Must be your
-  # tailnet 100.x address, or "127.0.0.1" for local-dev testing.
-  # v0.12 hardening (S1): the sink refuses to start on 0.0.0.0 or
-  # any non-tailnet routable address. `agentcookie wizard install
-  # --as sink` writes the resolved 100.x address automatically.
+  # Address the sink's /sync HTTP listener binds to. Use your current
+  # Tailscale 100.x address. After Tailscale re-auth, if this IP becomes
+  # stale (no longer on any local interface), the sink auto-rebinds to
+  # the new 100.x address on startup.
+  #
+  # Find your current Tailscale IP: tailscale ip -4
   addr: 100.x.y.z:9999
 
-cdp:
-  # The default v0.2 install path. The sink launches its own Chrome subprocess
-  # with --remote-debugging-port=AUTO and an isolated --user-data-dir. Cookies
-  # land via Chrome DevTools Protocol Storage.setCookies, so the sink never
-  # calls macOS Keychain. No interactive prompts. No screen-sharing needed.
-  enabled: true
-  managed: true
-  # profile_dir defaults to ~/.agentcookie/chrome-profile when omitted.
-  # chrome_binary defaults to /Applications/Google Chrome.app/Contents/MacOS/Google Chrome.
-
-# chrome:
-#   # Only set db_path when running in legacy SQLite mode (managed: false AND
-#   # cdp.enabled: false). The managed CDP path does not touch SQLite.
-#   db_path: ~/Library/Application Support/Google/Chrome/Default/Cookies
-
 peer:
-  # Hostname of the source machine. After `agentcookie pair --as sink ...`
-  # finishes, this is the filename under ~/.config/agentcookie/keys/.
-  hostname: my-laptop.tailnet.ts.net
+  # Hostname of the source machine (your Mac). After pairing, this
+  # matches the filename under ~/.config/agentcookie/keys/.
+  #
+  # Find your Mac's hostname: tailscale status
+  hostname: your-mac.tailnet.ts.net
 
-# Legacy security.shared_secret still accepted as a fallback for users who
-# have not paired yet. After pairing, delete the field below.
-# security:
-#   shared_secret: only-set-this-before-you-pair
+# Live CDP injection: attach to an ALREADY-RUNNING Chrome and inject
+# cookies via Chrome DevTools Protocol. This is the featured Linux path.
+#
+# Start Chrome with: google-chrome --remote-debugging-port=9223
+#
+# Do NOT set cdp.enabled or cdp.managed - those launch a SECOND Chrome
+# subprocess which conflicts with browserUse/Puppeteer/Playwright
+# connecting to the existing Chrome.
+live_cdp:
+  enabled: true
+  # Default endpoint. Change if Chrome runs on a different port.
+  # Common alternatives: 9222, 9224, 9228, 9229
+  endpoint: http://127.0.0.1:9223
+
+# Skip Chrome SQLite write. On Linux there's no Keychain and no way
+# to write Chrome's encrypted cookie database. All injection is via CDP.
+skip_chrome_sqlite: true
+
+# --- macOS-only options (do not use on Linux) ---
+#
+# cdp:
+#   # Launches a managed Chrome subprocess with its own profile.
+#   # Use only on macOS when you want CDP injection into an
+#   # agentcookie-owned Chrome, not your everyday browser.
+#   enabled: true
+#   managed: true
+#   # profile_dir: ~/.agentcookie/chrome-profile
+#
+# chrome:
+#   # Only set db_path for legacy SQLite mode on macOS.
+#   # db_path: ~/Library/Application Support/Google/Chrome/Default/Cookies

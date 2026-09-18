@@ -37,6 +37,46 @@ domains:
 	}
 }
 
+func TestStatusReportsResolvedSourceSinks(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	writeCLIFile(t, filepath.Join(dir, "source.yaml"), `
+sinks:
+  - url: http://first.test:9999/sync
+    peer: first
+  - url: http://second.test:9999/sync
+    peer: second
+cdp_source:
+  enabled: true
+  endpoint: http://127.0.0.1:9222
+`)
+
+	oldDir := common.ConfigDir
+	oldJSON := common.JSON
+	common.ConfigDir = dir
+	common.JSON = false
+	t.Cleanup(func() {
+		common.ConfigDir = oldDir
+		common.JSON = oldJSON
+	})
+
+	out := captureStdout(t, func() {
+		if err := statusCmd.RunE(commandWithOutput(&bytes.Buffer{}), nil); err != nil {
+			t.Fatalf("status: %v", err)
+		}
+	})
+	want := "source -> http://first.test:9999/sync, http://second.test:9999/sync"
+	if !strings.Contains(out, want) {
+		t.Fatalf("status should report resolved source sinks %q, got %q", want, out)
+	}
+	if !strings.Contains(out, "cdp source: http://127.0.0.1:9222") {
+		t.Fatalf("status should identify the active CDP source, got %q", out)
+	}
+	if strings.Contains(out, "chrome db:") {
+		t.Fatalf("status must not present a SQLite source for a CDP source, got %q", out)
+	}
+}
+
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
 	old := os.Stdout

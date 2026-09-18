@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 #
-# release-tarball.sh - Build the closed-beta release tarball that goes
-# into a GitHub release. Bundles the notarized agentcookie binary with
-# the install-beta.sh script and the closed-beta quickstart guide. The
-# install script knows how to consume this exact shape.
+# release-tarball.sh - Build the release tarball for darwin-arm64.
+# Bundles the notarized agentcookie binary with the install-beta.sh script
+# and the quickstart guide.
 #
 # Usage:
 #   scripts/release-tarball.sh <version>
 #
-# Where <version> matches the release tag (e.g. v0.12.0-beta.1). The
-# script produces:
+# Where <version> matches the release tag (e.g. v1.0.0). The script produces:
 #
-#   dist/agentcookie-<version>-darwin-arm64.tar.gz
+#   dist/agentcookie_<version-without-v>_darwin_arm64.tar.gz
+#
+# Example: v1.0.0 -> dist/agentcookie_1.0.0_darwin_arm64.tar.gz
 #
 # Prereqs:
 #   1. bin/agentcookie exists, signed and notarized (run `make release`
@@ -30,6 +30,9 @@ if [[ $# -lt 1 ]]; then
   exit 1
 fi
 VERSION="$1"
+
+# Strip leading 'v' from version for archive naming
+VERSION_NUM="${VERSION#v}"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -56,12 +59,13 @@ fi
 
 ARCH="$(uname -m)"
 if [[ "$ARCH" == "arm64" ]]; then
-  TARBALL_ARCH="darwin-arm64"
+  TARBALL_ARCH="darwin_arm64"
 else
-  TARBALL_ARCH="darwin-$ARCH"
+  TARBALL_ARCH="darwin_$ARCH"
 fi
 
-OUT_NAME="agentcookie-${VERSION}-${TARBALL_ARCH}"
+# Use underscore naming: agentcookie_1.0.0_darwin_arm64
+OUT_NAME="agentcookie_${VERSION_NUM}_${TARBALL_ARCH}"
 DIST_DIR="dist"
 mkdir -p "$DIST_DIR"
 STAGE="$(mktemp -d -t agentcookie-release.XXXXXX)/$OUT_NAME"

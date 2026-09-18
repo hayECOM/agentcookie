@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/mvanhorn/agentcookie/internal/config"
 )
 
 // errInjectedKeychainOpen is the failure injected into the
@@ -533,5 +535,150 @@ func TestSkipChromeSQLiteHelpNotStale(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(f.Usage), "degraded") {
 		t.Errorf("help should describe the degraded opt-out: %q", f.Usage)
+	}
+}
+
+func TestBuildAddSinkYAMLMigratesLegacyAndAppends(t *testing.T) {
+	cfg := &config.SourceConfig{
+		Sink:   config.SinkRef{URL: "http://first.test:9999/sync"},
+		Peer:   config.PeerRef{Hostname: "first"},
+		Chrome: config.ChromeRef{DBPath: "/tmp/Cookies"},
+	}
+	yamlBody, err := buildAddSinkYAML(cfg, "http://second.test:9999/sync", "second")
+	if err != nil {
+		t.Fatalf("buildAddSinkYAML: %v", err)
+	}
+	// The rendered YAML must decode through the real loader into two sinks.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "source.yaml"), []byte(yamlBody), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	loaded, err := config.LoadSource(dir)
+	if err != nil {
+		t.Fatalf("LoadSource on rendered YAML: %v", err)
+	}
+	got := loaded.ResolvedSinks()
+	if len(got) != 2 {
+		t.Fatalf("expected 2 sinks after add, got %d (%s)", len(got), yamlBody)
+	}
+	if got[0].Peer != "first" || got[1].Peer != "second" {
+		t.Errorf("sinks wrong: %+v", got)
+	}
+	if strings.Contains(yamlBody, "\nsink:\n") {
+		t.Errorf("rendered YAML must not emit a legacy sink: block:\n%s", yamlBody)
+	}
+}
+
+func TestBuildAddSinkYAMLPreservesCDPSource(t *testing.T) {
+	cfg := &config.SourceConfig{
+		Sinks: []config.SinkTarget{{URL: "http://first.test:9999/sync", Peer: "first"}},
+		CDPSource: config.CDPSourceRef{
+			Enabled:  true,
+			Endpoint: "http://127.0.0.1:9222",
+		},
+	}
+	yamlBody, err := buildAddSinkYAML(cfg, "http://second.test:9999/sync", "second")
+	if err != nil {
+		t.Fatalf("buildAddSinkYAML: %v", err)
+	}
+	if strings.Contains(yamlBody, "\nchrome:\n") || strings.Contains(yamlBody, "\nbrowser:\n") {
+		t.Fatalf("CDP source render must not add SQLite/browser source settings:\n%s", yamlBody)
+	}
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "source.yaml"), []byte(yamlBody), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	loaded, err := config.LoadSource(dir)
+	if err != nil {
+		t.Fatalf("LoadSource on rendered CDP YAML: %v\n%s", err, yamlBody)
+	}
+	if !loaded.CDPSource.Enabled || loaded.CDPSource.Endpoint != "http://127.0.0.1:9222" {
+		t.Fatalf("CDP source changed during add-sink: %+v", loaded.CDPSource)
+	}
+	if got := loaded.ResolvedSinks(); len(got) != 2 || got[0].Peer != "first" || got[1].Peer != "second" {
+		t.Fatalf("rendered sinks = %+v, want first and second", got)
+	}
+}
+
+func TestBuildAddSinkYAMLPreservesCmuxDomainFilter(t *testing.T) {
+	tests := []struct {
+		name string
+		cmux config.CmuxRef
+	}{
+		{
+			name: "enabled loop",
+			cmux: config.CmuxRef{
+				Enabled:      true,
+				CmuxPath:     "/opt/cmux/bin/cmux",
+				DomainFilter: []string{"%github.com", "%.example.com"},
+			},
+		},
+		{
+			name: "manual sync",
+			cmux: config.CmuxRef{
+				CmuxPath:     "/opt/cmux/bin/cmux",
+				DomainFilter: []string{"%github.com", "%.example.com"},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.SourceConfig{
+				Sinks:  []config.SinkTarget{{URL: "http://first.test:9999/sync", Peer: "first"}},
+				Chrome: config.ChromeRef{DBPath: "/tmp/Cookies"},
+				Cmux:   tt.cmux,
+			}
+			yamlBody, err := buildAddSinkYAML(cfg, "http://second.test:9999/sync", "second")
+			if err != nil {
+				t.Fatalf("buildAddSinkYAML: %v", err)
+			}
+
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "source.yaml"), []byte(yamlBody), 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			loaded, err := config.LoadSource(dir)
+			if err != nil {
+				t.Fatalf("LoadSource on rendered YAML: %v\n%s", err, yamlBody)
+			}
+			if loaded.Cmux.Enabled != tt.cmux.Enabled || loaded.Cmux.CmuxPath != tt.cmux.CmuxPath {
+				t.Fatalf("cmux settings changed during add-sink: got %+v, want %+v", loaded.Cmux, tt.cmux)
+			}
+			if got, want := strings.Join(loaded.Cmux.DomainFilter, ","), strings.Join(tt.cmux.DomainFilter, ","); got != want {
+				t.Fatalf("cmux domain_filter = %q, want %q\n%s", got, want, yamlBody)
+			}
+		})
+	}
+}
+
+func TestBuildAddSinkYAMLRejectsDuplicatePeer(t *testing.T) {
+	cfg := &config.SourceConfig{
+		Sinks: []config.SinkTarget{{URL: "http://a.test/sync", Peer: "alpha"}},
+	}
+	if _, err := buildAddSinkYAML(cfg, "http://a2.test/sync", "alpha"); err == nil {
+		t.Fatal("expected error for duplicate peer, got nil")
+	}
+	if _, err := buildAddSinkYAML(cfg, "http://a.test/sync", "beta"); err == nil {
+		t.Fatal("expected error for duplicate URL, got nil")
+	}
+}
+
+func TestRenderSourceYAMLSinksPreservesSharedSecret(t *testing.T) {
+	cfg := &config.SourceConfig{
+		Chrome:   config.ChromeRef{DBPath: "/tmp/Cookies"},
+		Security: config.SecurityRef{SharedSecret: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+	}
+	body := renderSourceYAMLSinks(cfg, []config.SinkTarget{{URL: "http://a.test/sync"}})
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "source.yaml"), []byte(body), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	loaded, err := config.LoadSource(dir)
+	if err != nil {
+		t.Fatalf("LoadSource: %v (body:\n%s)", err, body)
+	}
+	if loaded.Security.SharedSecret == "" {
+		t.Error("shared secret not preserved through render")
 	}
 }

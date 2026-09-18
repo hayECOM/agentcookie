@@ -146,9 +146,9 @@ if [[ -z "$TARBALL" ]]; then
   if ! gh auth status >/dev/null 2>&1; then
     die "gh is not authenticated. Run 'gh auth login' first."
   fi
-  step "downloading latest beta release from $REPO"
+  step "downloading latest release from $REPO"
   TMP_DL="$(mktemp -d -t agentcookie-beta.XXXXXX)"
-  gh release download --repo "$REPO" --pattern '*darwin-arm64.tar.gz' --dir "$TMP_DL" --clobber
+  gh release download --repo "$REPO" --pattern '*darwin_arm64.tar.gz' --dir "$TMP_DL" --clobber
   TARBALL="$(ls -1 "$TMP_DL"/*.tar.gz | head -n1)"
   if [[ -z "$TARBALL" || ! -f "$TARBALL" ]]; then
     die "release tarball not found after download (looked in $TMP_DL)"

@@ -56,25 +56,25 @@ agentcookie trusts:
 
 - v0.12 (this release) closes every Critical and High finding from the v0.11 threat survey except S5 (plaintext sidecar at rest), which stays open in the default install because turning sealing on requires the PP CLI consumer-side (U12) to ship in cli-printing-press first. Operators who only run agentcookie-controlled binaries on the sink can pass `wizard set-keychain-access --enable-sealing` to opt in; the on-disk sidecar and adapter session files become sealed and S5 closes for them.
 - v0.13 (planned) will migrate the paired key keystore at `~/.config/agentcookie/keys/<peer>.json` into the macOS Keychain, closing the last on-disk plaintext credential.
-- v0.14 adds Linux sink support via Tailscale `/sync` with live CDP injection. Key security differences on Linux:
-  - **Tailscale required**: The Linux sink MUST bind a Tailscale 100.x address. It refuses to start without a working tailnet connection. This is the trust boundary — pairing-derived keys, AES-GCM-sealed envelopes, and 100.x bind policy. Plaintext cookie JSON file transfers are not a supported path.
+- v1.0 adds Linux sink support via Tailscale `/sync` with live CDP injection. Key security differences on Linux:
+  - **Tailscale required**: The Linux sink MUST bind a Tailscale 100.x address. It refuses to start without a working tailnet connection. This is the trust boundary - pairing-derived keys, AES-GCM-sealed envelopes, and 100.x bind policy. Plaintext cookie JSON file transfers are not a supported path.
   - **No Keychain**: Linux has no macOS Keychain; the sink never touches Chrome's encryption layer.
-  - **Allowlist-empty default**: Missing `blocklist.yaml` or missing `policy` field defaults to an empty allowlist (ship nothing) on Linux, not the macOS blocklist default (sync-all). This is security-by-default for untrusted sinks.
+  - **Allowlist-empty default**: Missing `blocklist.yaml` or missing `policy` field defaults to an empty allowlist (ship nothing) on Linux, not the macOS blocklist default (sync-all). This is security-by-default for untrusted sinks. For a single-operator trusted box (like your own Grok Bot VM), the featured setup writes `blocklist.yaml` with `policy: blocklist` and `domains: []` to enable sync-all - this is an explicit operator choice, not the code default.
   - **CDP-only injection**: Cookies go straight into Chrome's in-memory store via CDP; there's no on-disk Chrome SQLite write on Linux.
   - **Threat surface**: Same-user processes can connect to Chrome's CDP port while it's open. The CDP port is loopback-only (`127.0.0.1:9223`), never on the tailnet. Treat a Linux agent runtime as a same-user trust boundary.
 
 ## Linux sink specifics
 
-The Linux receive path (v0.14+) operates under a stricter trust model than the macOS sink:
+The Linux receive path (v1.0+) operates under a stricter trust model than the macOS sink:
 
 - **Tailscale-only transport**: The Linux sink receives cookies via the same `/sync` endpoint as macOS sinks, over the Tailscale tailnet. The sink MUST bind a 100.x tailnet IP; a missing tailnet is a hard fail, not a fallback. The trust boundary is: pairing-derived 32-byte keys, AES-256-GCM-sealed envelopes, replay defense via persistent sequence tracking, and 100.x-only bind policy.
 - **Source stays macOS**: Linux never decrypts Chrome Safe Storage or reads the macOS Keychain. Cookie values arrive encrypted in the sync envelope and are decrypted by the Linux sink using the pairing-derived key.
 - **No Chrome SQLite rewrite**: agentcookie does not call libsecret or write Chrome's Cookies file on Linux. All injection is live CDP.
-- **Cookie policy**: Missing policy defaults to allowlist-empty. The operator must explicitly opt domains into sync via `blocklist.yaml` with `policy: allowlist`.
+- **Cookie policy**: Missing policy defaults to allowlist-empty. For a single-operator trusted box, the featured setup writes `blocklist.yaml` with `policy: blocklist` and `domains: []` to enable sync-all. For multi-user or less-trusted sinks, use `policy: allowlist` with specific domains.
 - **CDP surface**: The sink attaches to an already-running Chrome's CDP endpoint (default `http://127.0.0.1:9223`). Chrome must have been started with `--remote-debugging-port=9223`. The CDP port is loopback-only; it is never exposed on the tailnet. While the endpoint is open locally, any same-user process can connect to it.
 - **Replay defense**: Same as macOS — persistent sequence tracking in `~/.agentcookie/sequence.json`.
 - **Doctor/wizard**: On Linux, `agentcookie doctor` does not check Keychain, LaunchAgents, or codesign — those are macOS-specific. It checks CDP connectivity and tailnet bind instead.
 
 ## Reporting issues
 
-Open an issue at https://github.com/mvanhorn/agentcookie. For sensitive findings, contact the maintainer directly.
+Open an issue at https://github.com/mvanhorn/agentcookie/issues. For sensitive findings, send a direct message to the maintainer on X at https://x.com/mvanhorn.

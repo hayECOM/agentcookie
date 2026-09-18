@@ -193,3 +193,72 @@ func TestFormatCookieHeader_Empty(t *testing.T) {
 		t.Errorf("empty slice: got %q, want empty", got)
 	}
 }
+
+func TestInstacartAdapter_CachedNonExecutable_ReResolvesToValid(t *testing.T) {
+	// If the adapter is initialized with a cached path that points to a
+	// non-executable file, resolveBinary() should re-resolve via findPPCLI
+	// and find a valid executable elsewhere. This is the fix for "cached
+	// fallback blocks re-resolution" where a junk file at the preferred
+	// location could cause IsInstalled() to succeed but Push() to fail.
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("PATH", "")
+
+	localBin := filepath.Join(tmpHome, ".local", "bin")
+	goBin := filepath.Join(tmpHome, "go", "bin")
+	if err := os.MkdirAll(localBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(goBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Put a non-executable junk file at .local/bin (mode 0644).
+	junkPath := filepath.Join(localBin, "instacart-pp-cli")
+	if err := os.WriteFile(junkPath, []byte("junk, not executable"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Put a valid executable at go/bin.
+	validPath := filepath.Join(goBin, "instacart-pp-cli")
+	if err := os.WriteFile(validPath, []byte("#!/bin/bash\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create adapter with the non-executable path cached (simulates init() before install).
+	a := &InstacartAdapter{binary: junkPath}
+
+	// resolveBinary() should re-resolve since the cached path is not executable.
+	resolved := a.resolveBinary()
+	if resolved != validPath {
+		t.Errorf("resolveBinary() with non-executable cached: got %q, want %q", resolved, validPath)
+	}
+
+	// IsInstalled() should report true (finds the valid executable).
+	if !a.IsInstalled() {
+		t.Errorf("IsInstalled() = false, want true when valid executable exists at %q", validPath)
+	}
+}
+
+func TestInstacartAdapter_CachedExecutable_UsesCache(t *testing.T) {
+	// If the cached binary is executable, resolveBinary() should use it
+	// without re-resolving. This ensures the direct test injection pattern
+	// still works.
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "custom-location")
+	if err := os.WriteFile(bin, []byte("#!/bin/bash\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	a := &InstacartAdapter{binary: bin}
+
+	// Should use the cached path since it's executable.
+	resolved := a.resolveBinary()
+	if resolved != bin {
+		t.Errorf("resolveBinary() with executable cached: got %q, want %q", resolved, bin)
+	}
+
+	if !a.IsInstalled() {
+		t.Errorf("IsInstalled() = false, want true for cached executable")
+	}
+}

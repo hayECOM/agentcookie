@@ -1,134 +1,239 @@
 ---
 name: agentcookie-install
-description: Install agentcookie on the user's source (laptop) and sink (Mac mini / cloud VM / second Mac) machines and pair them so Chrome cookies sync continuously over their Tailscale tailnet. Use when the user says "install agentcookie", "set up cookie sync", "share my Chrome sessions with my Mac mini", or "make my agent log in as me".
-version: 0.2.0
+description: Install agentcookie on a Mac source and a Linux or Mac sink so Chrome cookies sync continuously over Tailscale. Use when the user says "install agentcookie", "set up cookie sync", "share my Chrome sessions with my agent box", or "make my agent log in as me".
+version: 1.0.0
 ---
 
 # agentcookie install
 
 You are helping the user install agentcookie on two machines that are both on the same Tailscale tailnet, then pair them, so that the sink's Chrome stays continuously in sync with the source's Chrome.
 
-After install, the user does not touch agentcookie again. A LaunchAgent on each side keeps the daemons running across reboots. The source watches Chrome via fsnotify and pushes every cookie change to the sink within seconds. The sink writes via Chrome DevTools Protocol into a dedicated managed Chrome subprocess. No Keychain prompt fires on the sink. No screen-sharing required.
-
-The user expects one prompt ("install agentcookie on my laptop and my Mac mini") to be enough. Make that real.
+After install, the user does not touch agentcookie again. The source watches Chrome via fsnotify and pushes every cookie change to the sink within seconds. On Linux, the sink injects cookies via CDP into an already-running Chrome. On macOS, a LaunchAgent keeps the daemon running across reboots.
 
 ## Inputs you need
 
-1. Which machine is the **source** (the machine the user logs into Chrome on, usually their laptop).
-2. Which machine is the **sink** (the machine where AI agents act, usually a Mac mini or cloud VM).
-3. Tailscale is up on both, and the user can SSH from source to sink without a password prompt.
+1. Which machine is the **source** (the Mac the user logs into Chrome on, usually their laptop).
+2. Which machine is the **sink** (where AI agents act - a Linux VM like Grok Bot, or a second Mac).
+3. Tailscale is up on both.
+4. On Linux: Chrome is running with `--remote-debugging-port=9223` (or another port).
 
 If any of these are missing, stop and ask.
 
-## Flow
+## Flow: Mac source to Linux sink (featured path)
 
 ### Step 0: detect the lay of the land
 
 Run on the current machine:
 
 ```bash
-which agentcookie 2>/dev/null || echo "missing"
-/Applications/Tailscale.app/Contents/MacOS/Tailscale status 2>&1 | head -20
-ssh -o ConnectTimeout=5 -o BatchMode=yes <suspected-sink> 'whoami' 2>&1
+uname -s  # Darwin = macOS, Linux = Linux
+tailscale status 2>&1 | head -20
 ```
 
-From the Tailscale status output, the current machine is the entry marked "active" or appears at the top. Every other macOS entry is a candidate sink.
+From the Tailscale status output, identify which host is the Mac and which is the Linux box.
 
 ### Step 1: confirm source vs sink with the user
 
 Use the platform's blocking question primitive. Phrase it concretely:
 
-> I see you're on `<current-hostname>`. Looks like `<other-hostname>` (Tailscale IP `100.x.y.z`) is your other Mac. Should I install agentcookie with `<current-hostname>` as the source (your logged-in Chrome) and `<other-hostname>` as the sink (where your agents run)?
+> I see you're on `<current-hostname>`. Looks like `<other-hostname>` (Tailscale IP `100.x.y.z`) is your other machine. Should I install agentcookie with `<current-hostname>` as the source (your logged-in Chrome) and `<other-hostname>` as the sink (where your agents run)?
 
 Confirm before proceeding. If wrong, ask which is which.
 
-### Step 2: install on the source
+### Step 2: install on the Mac source
 
 Install the binary if missing:
 
 ```bash
-go install github.com/mvanhorn/agentcookie/cmd/agentcookie@latest
+# Download from GitHub Releases
+curl -LO https://github.com/mvanhorn/agentcookie/releases/download/v1.0.0/agentcookie_1.0.0_darwin_arm64.tar.gz
+tar -xzf agentcookie_1.0.0_darwin_arm64.tar.gz
+sudo mv agentcookie /usr/local/bin/
 ```
 
-Run the source-side wizard. It blocks until pairing completes:
+Or build from source:
 
 ```bash
-agentcookie wizard install --as source --peer <sink-hostname> --local-name <source-hostname> &
+go install github.com/mvanhorn/agentcookie/cmd/agentcookie@v1.0.0
+```
+
+Run the source wizard. It blocks until pairing completes:
+
+```bash
+agentcookie wizard install --as source --peer <linux-hostname> &
 WIZARD_PID=$!
 ```
 
 Run in the background because we need to poll the pairing info file:
 
 ```bash
-# Wait up to 10 seconds for the pairing info to appear.
-for i in {1..40}; do
+# Wait up to 30 seconds for the pairing info to appear.
+for i in {1..120}; do
   if [ -f ~/.agentcookie/pairing.json ]; then break; fi
   sleep 0.25
 done
 cat ~/.agentcookie/pairing.json
 ```
 
-Extract `code` and `pair_url` from the JSON output. These are what the sink needs.
+Extract `code` and `pair_url` from the JSON output. These are what the sink needs. The code expires in 10 minutes.
 
-### Step 3: install on the sink
+### Step 3: install on the Linux sink
 
-SSH to the sink and run its wizard. You can pass everything on one line:
+Do NOT run `wizard install --as sink` on Linux. The wizard omits the policy file (which means allowlist-empty / ship nothing) and can write `cdp.enabled: true` (which launches a second Chrome that fights your existing Chrome).
+
+Instead, write the config files directly:
 
 ```bash
-ssh <sink-hostname> "go install github.com/mvanhorn/agentcookie/cmd/agentcookie@latest && \
-  agentcookie wizard install --as sink \
-    --peer <source-hostname> \
-    --code <code-from-pairing.json> \
-    --pair-url <pair_url-from-pairing.json> \
-    --local-name <sink-hostname>"
+# Install the binary
+curl -LO https://github.com/mvanhorn/agentcookie/releases/download/v1.0.0/agentcookie_1.0.0_linux_amd64.tar.gz
+tar -xzf agentcookie_1.0.0_linux_amd64.tar.gz
+sudo mv agentcookie /usr/local/bin/
+
+# Create config directory
+mkdir -p ~/.config/agentcookie
+
+# Get the Tailscale IP
+TAILSCALE_IP=$(tailscale ip -4)
+
+# Write sink.yaml
+cat > ~/.config/agentcookie/sink.yaml << EOF
+listen:
+  addr: ${TAILSCALE_IP}:9999
+
+peer:
+  hostname: <mac-hostname>  # REPLACE with Mac's Tailscale hostname
+
+live_cdp:
+  enabled: true
+  endpoint: http://127.0.0.1:9223
+
+skip_chrome_sqlite: true
+EOF
+
+# Write blocklist.yaml for sync-all on a trusted box
+cat > ~/.config/agentcookie/blocklist.yaml << 'EOF'
+version: 1
+policy: blocklist
+domains: []
+EOF
+
+# Pair with the Mac source
+agentcookie pair --as sink \
+  --peer <mac-hostname> \
+  --code <code-from-pairing.json> \
+  --pair-url <pair_url-from-pairing.json>
 ```
 
-The sink wizard:
-1. Drops `~/.config/agentcookie/{sink.yaml, allowlist.yaml}` with `cdp.managed: true` (zero Keychain involvement).
-2. Runs the X25519 + HKDF pairing handshake against the source's pair URL.
-3. Installs the sink LaunchAgent.
-4. Starts the sink, which spawns a dedicated Chrome subprocess for the agent's cookie target.
+### Step 4: attach to existing Chrome (or start one as fallback)
 
-### Step 4: confirm both daemons are up
+On Grok Bot and most agent runtimes, Chrome is already running with a debug port. Probe before starting a new one:
 
 ```bash
-launchctl list | grep dev.agentcookie
-ssh <sink-hostname> 'launchctl list | grep dev.agentcookie'
+# Check if Chrome is already listening on common debug ports
+for port in 9223 9222 9224 9228 9229; do
+  if curl -s "http://127.0.0.1:${port}/json/version" >/dev/null 2>&1; then
+    echo "Chrome found on port ${port}"
+    # Update sink.yaml to use this port
+    sed -i "s|endpoint: http://127.0.0.1:.*|endpoint: http://127.0.0.1:${port}|" \
+      ~/.config/agentcookie/sink.yaml
+    break
+  fi
+done
 ```
 
-Each should show `dev.agentcookie.source` (laptop) and `dev.agentcookie.sink` (Mac mini) with a PID.
-
-### Step 5: verify a real sync round-trip
+If no Chrome is listening, start one as a fallback:
 
 ```bash
+# Only if no existing Chrome debug port was found
+google-chrome --remote-debugging-port=9223 &
+```
+
+Starting a second Chrome when one is already running on the same port causes conflicts. Always probe first.
+
+### Step 5: start the sink
+
+```bash
+agentcookie sink
+```
+
+For a persistent daemon, write a systemd user unit:
+
+```bash
+mkdir -p ~/.config/systemd/user/
+cat > ~/.config/systemd/user/agentcookie-sink.service << 'EOF'
+[Unit]
+Description=agentcookie sink
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/agentcookie sink
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user enable --now agentcookie-sink.service
+```
+
+### Step 6: verify the install
+
+```bash
+# On Mac
+agentcookie doctor
 agentcookie status --json
-ssh <sink-hostname> 'agentcookie status --json'
+
+# On Linux
+agentcookie doctor
+agentcookie status --json
 ```
 
-The source should report a recent push timestamp. The sink should report a recent write count. If either is empty, log into a github.com tab on the source's Chrome to force a cookie write and re-check.
+On Linux, look for:
+- `live_cdp: endpoint reachable` - must be OK
+- `tailnet: bind address` - must be OK
+- `LastWriteMode` containing `livecdp` in status output
+- `live_cdp: injected N cookies into M context(s)` in sync output
 
-### Step 6: report to the user
+Ignore expected FAILs on Linux: codesign, Chrome.app path, launchctl (these are macOS-specific).
+
+The message `wrote 0 cookies` for Chrome SQLite is expected on Linux. Success is the live CDP inject line.
+
+### Step 7: report to the user
 
 In plain language. Example:
 
-> Done. agentcookie is running on both `<source>` and `<sink>`. The source pushes cookies as soon as they change in Chrome on `<source>`; the sink writes them into a dedicated Chrome instance at `~/.agentcookie/chrome-profile` on `<sink>`. Your agents on `<sink>` connect to that Chrome via CDP at `~/.agentcookie/chrome-profile`. After this install, the user does not run agentcookie commands by hand again.
+> Done. agentcookie is running on both `<source>` and `<sink>`. The source pushes cookies as soon as they change in Chrome. The sink injects them via CDP into Chrome at port 9223. browserUse, Puppeteer, Playwright, or any Chromium automation connecting to that port will see your logged-in session.
+
+## Flow: Mac source to Mac sink
+
+For Mac-to-Mac, the wizard works:
+
+```bash
+# On the second Mac
+agentcookie wizard install --as sink \
+  --peer <source-mac-hostname> \
+  --code <pairing-code> \
+  --pair-url http://<source-mac>:9998/pair
+```
+
+The macOS sink writes to Chrome's encrypted SQLite, the plaintext sidecar, and per-CLI adapter session files.
 
 ## What to do if something errors
 
-**`agentcookie: command not found` on the sink after `go install`.** The sink's `$PATH` lacks `~/go/bin`. Tell the user (or fix by sourcing `~/.zshrc` on the SSH command, or invoke the binary by absolute path: `~/go/bin/agentcookie`).
+**`agentcookie: command not found`**: The binary is not on `$PATH`. Either use the full path (`/usr/local/bin/agentcookie`) or add the bin directory to PATH.
 
-**Sink pairing returns `connection refused`.** Tailscale ACLs may be blocking tailnet-internal traffic on port 9998. Check `tailscale status` shows the source as reachable. If the source is online but unreachable, the user has restrictive ACLs to relax.
+**Sink pairing returns `connection refused`**: Tailscale ACLs may be blocking tailnet-internal traffic on port 9998. Check `tailscale status` shows the source as reachable. If the source is online but unreachable, the user has restrictive ACLs to relax.
 
-**Sink wizard hangs at `Chrome did not publish DevToolsActivePort`.** The managed Chrome subprocess failed to start. Most likely: Google Chrome is not installed at `/Applications/Google Chrome.app`. Install Chrome or set `cdp.chrome_binary` in sink.yaml.
+**`live_cdp: endpoint reachable FAIL`**: Chrome is not running with `--remote-debugging-port`. Start Chrome with the debug port, or check that the port in sink.yaml matches the actual port.
 
-**`agentcookie status` reports zero pushes after install.** The source watcher has not seen a Chrome write yet. Open a tab on the source's Chrome (any allowlisted domain) and refresh. Push should appear within 2 seconds.
+**`agentcookie status` reports zero syncs**: The source watcher has not seen a Chrome write yet. Open a tab on the source's Chrome (any domain) and refresh. The sync should appear within 2 seconds.
 
-**Sink Chrome subprocess crashes repeatedly.** Check `~/.agentcookie/logs/sink.err.log`. Most common cause: stale lockfile from a prior Chrome session sharing the user-data-dir. Solution: `rm ~/.agentcookie/chrome-profile/SingletonLock` and let the supervisor restart.
+**Doctor shows `sync-all` but cookies don't land**: The policy label and actual behavior can diverge. Verify success with `live_cdp: injected N cookies into M context(s)` in the sync output, not the policy label. Also check `LastWriteMode` contains `livecdp`.
 
 ## Out of scope for this skill
 
-- Code-signing the binary so Keychain access is granted without a prompt.
-- Web Store extension install (planned for v0.3).
-- Linux sink support (planned for v0.3).
-- Bidirectional sync (planned for v0.3).
-- Adding new domains to the allowlist after install (the user edits `~/.config/agentcookie/allowlist.yaml` on each side; LaunchAgents pick up changes on next restart, which they do automatically every 10 seconds after a config save).
+- Changing the cookie policy or allowlist/blocklist rules (the user edits `~/.config/agentcookie/blocklist.yaml` directly)
+- Rotating pairing keys (re-run wizard on both sides)
+- One source to many sinks (not yet supported)

@@ -46,6 +46,7 @@ var (
 	wizardWriteChromeSQLite bool
 	wizardNoCDP             bool
 	wizardNoCmux            bool
+	wizardAddSink           bool
 )
 
 var wizardCmd = &cobra.Command{
@@ -108,6 +109,7 @@ func init() {
 	wizardInstallCmd.Flags().BoolVar(&wizardWriteChromeSQLite, "write-chrome-sqlite", false, "[sink] force universal delivery (write the real Default Chrome profile) and honor it even if the one-password keychain open cannot complete; does not silently downgrade to degraded")
 	wizardInstallCmd.Flags().BoolVar(&wizardNoCDP, "no-cdp", false, "[sink] do not enable CDP injection alongside skip_chrome_sqlite. By default, headless installs enable CDP injection so Chrome on the sink still sees synced cookies. Pass --no-cdp for sidecar+adapter-only mode.")
 	wizardInstallCmd.Flags().BoolVar(&wizardNoCmux, "no-cmux", false, "do not auto-enable the cmux local loop even if cmux is installed (by default, install wires Chrome->cmux delivery when cmux is present)")
+	wizardInstallCmd.Flags().BoolVar(&wizardAddSink, "add-sink", false, "[source] pair an ADDITIONAL sink and append it to an existing source.yaml (multi-sink fan-out) instead of overwriting; requires an existing source config")
 
 	wizardUninstallCmd.Flags().StringVar(&wizardRole, "as", "", "source | sink (required)")
 	wizardUninstallCmd.Flags().BoolVar(&wizardForce, "purge", false, "also delete configs and paired keys")
@@ -155,6 +157,14 @@ func runWizardInstall(cmd *cobra.Command, args []string) error {
 func wizardInstallSource(ctx context.Context, binPath, logDir string) error {
 	if err := os.MkdirAll(common.ConfigDir, 0o755); err != nil {
 		return err
+	}
+
+	// --add-sink: pair an ADDITIONAL peer and append it to an existing
+	// source.yaml as a multi-sink fan-out target, instead of the default
+	// overwrite-or-create flow. The running --watch daemon picks up the
+	// new sink on its next push, so no LaunchAgent reinstall is needed.
+	if wizardAddSink {
+		return wizardAddSinkToSource(ctx, binPath, logDir)
 	}
 
 	// Step 1: drop source.yaml + blocklist.yaml if missing or force.
@@ -213,17 +223,23 @@ func wizardInstallSource(ctx context.Context, binPath, logDir string) error {
 		fmt.Fprintf(os.Stderr, "agentcookie wizard: paired with %q (code was %s)\n", wizardPeer, code)
 	}
 
-	// Step 4: install the LaunchAgent unless skipped.
+	// Step 4: install the daemon unless skipped.
 	if !wizardSkipDaemon {
-		if err := installLaunchAgent(launchd.Spec{
-			Role:       launchd.RoleSource,
-			BinaryPath: binPath,
-			LogDir:     logDir,
-			ExtraArgs:  []string{"--watch"},
-		}); err != nil {
-			return fmt.Errorf("install source LaunchAgent: %w", err)
+		if config.IsLinux() {
+			// Linux: no LaunchAgents. Print systemd user unit or supervisor
+			// instructions so the operator can install the daemon themselves.
+			printLinuxDaemonInstructions("source", binPath, logDir, []string{"--watch"})
+		} else {
+			if err := installLaunchAgent(launchd.Spec{
+				Role:       launchd.RoleSource,
+				BinaryPath: binPath,
+				LogDir:     logDir,
+				ExtraArgs:  []string{"--watch"},
+			}); err != nil {
+				return fmt.Errorf("install source LaunchAgent: %w", err)
+			}
+			fmt.Fprintln(os.Stderr, "agentcookie wizard: source LaunchAgent installed and started")
 		}
-		fmt.Fprintln(os.Stderr, "agentcookie wizard: source LaunchAgent installed and started")
 	}
 
 	if !wizardSkipExitNode {
@@ -341,14 +357,20 @@ func wizardInstallSink(ctx context.Context, binPath, logDir string) error {
 	_ = keychainOpened
 
 	if !wizardSkipDaemon {
-		if err := installLaunchAgent(launchd.Spec{
-			Role:       launchd.RoleSink,
-			BinaryPath: binPath,
-			LogDir:     logDir,
-		}); err != nil {
-			return fmt.Errorf("install sink LaunchAgent: %w", err)
+		if config.IsLinux() {
+			// Linux: no LaunchAgents. Print systemd user unit or supervisor
+			// instructions so the operator can install the daemon themselves.
+			printLinuxDaemonInstructions("sink", binPath, logDir, nil)
+		} else {
+			if err := installLaunchAgent(launchd.Spec{
+				Role:       launchd.RoleSink,
+				BinaryPath: binPath,
+				LogDir:     logDir,
+			}); err != nil {
+				return fmt.Errorf("install sink LaunchAgent: %w", err)
+			}
+			fmt.Fprintln(os.Stderr, "agentcookie wizard: sink LaunchAgent installed and started")
 		}
-		fmt.Fprintln(os.Stderr, "agentcookie wizard: sink LaunchAgent installed and started")
 	}
 
 	if !wizardSkipExitNode {
@@ -492,6 +514,67 @@ func runWizardUninstall(cmd *cobra.Command, args []string) error {
 		_ = os.RemoveAll(filepath.Join(common.ConfigDir, "keys"))
 		fmt.Fprintln(os.Stderr, "agentcookie wizard: --purge set; configs and paired keys removed")
 	}
+	return nil
+}
+
+// wizardAddSinkToSource pairs an additional peer and appends it to an
+// existing source.yaml as a multi-sink fan-out target. It requires an
+// existing source config, validates the new sink is not a duplicate before
+// pairing, files the new key under the operator --peer name (via
+// beginSourcePairing), then rewrites source.yaml with the appended sinks
+// list. The running --watch daemon fans out to it on the next push.
+func wizardAddSinkToSource(ctx context.Context, binPath, logDir string) error {
+	sourcePath := filepath.Join(common.ConfigDir, "source.yaml")
+	if !fileExists(sourcePath) {
+		return fmt.Errorf("--add-sink needs an existing source.yaml; run `agentcookie wizard install --as source` first")
+	}
+	if wizardPeer == "" {
+		return fmt.Errorf("--add-sink requires --peer (the new sink's hostname)")
+	}
+	cfg, err := config.LoadSource(common.ConfigDir)
+	if err != nil {
+		return fmt.Errorf("load existing source.yaml: %w", err)
+	}
+	newURL := wizardSinkURL
+	if newURL == "" {
+		newURL = fmt.Sprintf("http://%s:9999/sync", wizardPeer)
+	}
+	// Validate (reject duplicate peer/URL) BEFORE pairing so a bad add
+	// does not leave an orphaned key behind.
+	newYAML, err := buildAddSinkYAML(cfg, newURL, wizardPeer)
+	if err != nil {
+		return err
+	}
+
+	// Pair the new peer. beginSourcePairing files the key under the
+	// operator --peer name (with the announced hostname recorded
+	// separately), which is the name buildAddSinkYAML wrote into sinks.
+	keyPath, _ := keystore.Path(common.ConfigDir, wizardPeer)
+	if fileExists(keyPath) && !wizardRepair {
+		fmt.Fprintf(os.Stderr, "agentcookie wizard: existing paired key for %q found; skipping pairing (use --repair to force)\n", wizardPeer)
+	} else {
+		listen := wizardListen
+		if listen == "" {
+			ip, err := tsclient.RequireTailnetIP(ctx)
+			if err != nil {
+				return fmt.Errorf("detect Tailscale 100.x address for pair listener: %w", err)
+			}
+			listen = fmt.Sprintf("%s:9998", ip)
+		} else if err := validateListenAddr(listen); err != nil {
+			return fmt.Errorf("--listen %q: %w", listen, err)
+		}
+		pairingInfo, code, err := beginSourcePairing(ctx, listen, wizardLocalName, binPath, logDir)
+		if err != nil {
+			return fmt.Errorf("pairing: %w", err)
+		}
+		fmt.Fprintln(os.Stderr, pairingInfo)
+		fmt.Fprintf(os.Stderr, "agentcookie wizard: paired additional sink %q (code was %s)\n", wizardPeer, code)
+	}
+
+	if err := os.WriteFile(sourcePath, []byte(newYAML), 0o600); err != nil {
+		return fmt.Errorf("write updated source.yaml: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "agentcookie wizard: appended sink %s (peer %q) to source.yaml; the --watch daemon will fan out to it on the next push\n", newURL, wizardPeer)
 	return nil
 }
 
@@ -667,6 +750,87 @@ chrome:
 peer:
   hostname: %s
 `, sinkURL, peer)
+}
+
+// renderSourceYAMLSinks renders a multi-sink source.yaml body, always as an
+// explicit sinks: list (never the legacy scalar sink:/peer:), preserving the
+// loaded config's selected source reader / security / cmux settings. Written via
+// template rather than yaml.Marshal on purpose: yaml.v3 does not omit a
+// zero-value legacy Sink struct even with omitempty, so marshaling a
+// sinks-only config would emit a stray empty sink: block.
+func renderSourceYAMLSinks(cfg *config.SourceConfig, sinks []config.SinkTarget) string {
+	var b strings.Builder
+	b.WriteString("sinks:\n")
+	for _, s := range sinks {
+		fmt.Fprintf(&b, "  - url: %s\n", s.URL)
+		if s.Peer != "" {
+			fmt.Fprintf(&b, "    peer: %s\n", s.Peer)
+		}
+	}
+	// CDP is mutually exclusive with the on-disk Chrome/browser reader.
+	// Preserve the selected mode without emitting a default SQLite path that
+	// would make the rewritten config invalid at its next load.
+	if cfg.CDPSource.Enabled {
+		b.WriteString("cdp_source:\n  enabled: true\n")
+		if cfg.CDPSource.Endpoint != "" {
+			fmt.Fprintf(&b, "  endpoint: %s\n", cfg.CDPSource.Endpoint)
+		}
+	} else {
+		dbPath := cfg.Chrome.DBPath
+		if dbPath == "" {
+			dbPath = "~/Library/Application Support/Google/Chrome/Default/Cookies"
+		}
+		b.WriteString("chrome:\n")
+		fmt.Fprintf(&b, "  db_path: %s\n", dbPath)
+		if cfg.Browser.Name != "" || cfg.Browser.Profile != "" {
+			b.WriteString("browser:\n")
+			if cfg.Browser.Name != "" {
+				fmt.Fprintf(&b, "  name: %s\n", cfg.Browser.Name)
+			}
+			if cfg.Browser.Profile != "" {
+				fmt.Fprintf(&b, "  profile: %s\n", cfg.Browser.Profile)
+			}
+		}
+	}
+	if cfg.Security.SharedSecret != "" {
+		b.WriteString("security:\n")
+		fmt.Fprintf(&b, "  shared_secret: %s\n", cfg.Security.SharedSecret)
+	}
+	if cfg.Cmux.Enabled || cfg.Cmux.CmuxPath != "" || len(cfg.Cmux.DomainFilter) > 0 {
+		b.WriteString("cmux:\n")
+		fmt.Fprintf(&b, "  enabled: %v\n", cfg.Cmux.Enabled)
+		if cfg.Cmux.CmuxPath != "" {
+			fmt.Fprintf(&b, "  cmux_path: %s\n", cfg.Cmux.CmuxPath)
+		}
+		if len(cfg.Cmux.DomainFilter) > 0 {
+			b.WriteString("  domain_filter:\n")
+			for _, pattern := range cfg.Cmux.DomainFilter {
+				fmt.Fprintf(&b, "    - %q\n", pattern)
+			}
+		}
+	}
+	return b.String()
+}
+
+// buildAddSinkYAML computes the new source.yaml body when adding a sink to an
+// already-loaded source config. It migrates a legacy single-sink config into
+// an explicit sinks: list and appends the new target, rejecting a duplicate
+// peer or URL so --add-sink is idempotent-safe.
+func buildAddSinkYAML(cfg *config.SourceConfig, newURL, newPeer string) (string, error) {
+	if newURL == "" {
+		return "", fmt.Errorf("a sink URL is required (set --sink-url or it defaults from --peer)")
+	}
+	sinks := append([]config.SinkTarget(nil), cfg.ResolvedSinks()...)
+	for _, s := range sinks {
+		if newPeer != "" && s.Peer == newPeer {
+			return "", fmt.Errorf("a sink for peer %q is already configured", newPeer)
+		}
+		if s.URL == newURL {
+			return "", fmt.Errorf("a sink with URL %q is already configured", newURL)
+		}
+	}
+	sinks = append(sinks, config.SinkTarget{URL: newURL, Peer: newPeer})
+	return renderSourceYAMLSinks(cfg, sinks), nil
 }
 
 // renderSinkYAML formats sink.yaml with a caller-resolved listen
@@ -980,4 +1144,133 @@ func errIsAlreadyLoaded(err error) bool {
 	// We do not enumerate them here; the kickstart attempt is safe regardless.
 	_ = time.Second // placeholder reference to avoid import-cleanup issues
 	return false
+}
+
+// systemdQuote returns an argument quoted for use in systemd ExecStart and
+// similar command-line directives. Systemd uses C-style escaping and wraps
+// in double quotes if the argument contains whitespace or systemd specifiers.
+func systemdQuote(path string) string {
+	needsQuotes := false
+	for _, c := range path {
+		if c == ' ' || c == '\t' || c == '%' || c == '"' || c == '\\' {
+			needsQuotes = true
+			break
+		}
+	}
+	if !needsQuotes {
+		return path
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, c := range path {
+		switch c {
+		case '\\', '"':
+			b.WriteByte('\\')
+			b.WriteRune(c)
+		case '%':
+			b.WriteString("%%")
+		default:
+			b.WriteRune(c)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// systemdEscapePath returns a path escaped for use in systemd file-path
+// directives like StandardOutput=append: and StandardError=append:.
+// These directives do NOT support quote-wrapped paths after the prefix;
+// instead, special characters must be C-style escaped directly.
+// See systemd.exec(5) for details.
+func systemdEscapePath(path string) string {
+	var b strings.Builder
+	for _, c := range path {
+		switch c {
+		case ' ':
+			b.WriteString("\\x20")
+		case '\t':
+			b.WriteString("\\x09")
+		case '\n':
+			b.WriteString("\\x0a")
+		case '\\':
+			b.WriteString("\\\\")
+		case '%':
+			b.WriteString("%%")
+		default:
+			b.WriteRune(c)
+		}
+	}
+	return b.String()
+}
+
+// shellQuote returns a path quoted for use in shell commands.
+// Uses single quotes which prevent all expansion except for embedded single quotes.
+func shellQuote(path string) string {
+	if !strings.ContainsAny(path, " \t'\"\\$`!") {
+		return path
+	}
+	return "'" + strings.ReplaceAll(path, "'", "'\\''") + "'"
+}
+
+// printLinuxDaemonInstructions prints systemd user unit instructions for Linux.
+// LaunchAgents are macOS-only; on Linux the operator must install the daemon
+// themselves. This function prints exact instructions including a systemd user
+// unit file the operator can copy, or supervisor/manual run commands.
+func printLinuxDaemonInstructions(role, binPath, logDir string, extraArgs []string) {
+	home, _ := os.UserHomeDir()
+	unitName := "agentcookie-" + role + ".service"
+	unitPath := filepath.Join(home, ".config", "systemd", "user", unitName)
+
+	// Build the command line from the actual binary path (os.Executable()).
+	// Quote each argument for systemd's ExecStart parsing.
+	quotedArgs := make([]string, 0, len(extraArgs)+2)
+	quotedArgs = append(quotedArgs, systemdQuote(binPath), role)
+	for _, arg := range extraArgs {
+		quotedArgs = append(quotedArgs, systemdQuote(arg))
+	}
+	execStart := strings.Join(quotedArgs, " ")
+
+	// Build shell-quoted manual run command.
+	shellArgs := make([]string, 0, len(extraArgs)+2)
+	shellArgs = append(shellArgs, shellQuote(binPath), role)
+	for _, arg := range extraArgs {
+		shellArgs = append(shellArgs, shellQuote(arg))
+	}
+	manualRun := strings.Join(shellArgs, " ")
+
+	outLog := filepath.Join(logDir, role+".out.log")
+	errLog := filepath.Join(logDir, role+".err.log")
+
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "agentcookie wizard: Linux detected; LaunchAgents are macOS-only.")
+	fmt.Fprintln(os.Stderr, "agentcookie wizard: To run the daemon, use one of these methods:")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "  1. SYSTEMD USER UNIT (recommended for persistent operation):")
+	fmt.Fprintf(os.Stderr, "     mkdir -p %s\n", shellQuote(filepath.Dir(unitPath)))
+	fmt.Fprintf(os.Stderr, "     cat > %s << 'EOF'\n", shellQuote(unitPath))
+	fmt.Fprintln(os.Stderr, "[Unit]")
+	fmt.Fprintf(os.Stderr, "Description=agentcookie %s daemon\n", role)
+	fmt.Fprintln(os.Stderr, "After=network.target")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "[Service]")
+	fmt.Fprintf(os.Stderr, "ExecStart=%s\n", execStart)
+	fmt.Fprintln(os.Stderr, "Restart=on-failure")
+	fmt.Fprintln(os.Stderr, "RestartSec=10")
+	fmt.Fprintf(os.Stderr, "StandardOutput=append:%s\n", systemdEscapePath(outLog))
+	fmt.Fprintf(os.Stderr, "StandardError=append:%s\n", systemdEscapePath(errLog))
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "[Install]")
+	fmt.Fprintln(os.Stderr, "WantedBy=default.target")
+	fmt.Fprintln(os.Stderr, "EOF")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "     Then run:")
+	fmt.Fprintf(os.Stderr, "     mkdir -p %s\n", shellQuote(logDir))
+	fmt.Fprintln(os.Stderr, "     systemctl --user daemon-reload")
+	fmt.Fprintf(os.Stderr, "     systemctl --user enable --now %s\n", unitName)
+	fmt.Fprintf(os.Stderr, "     systemctl --user status %s\n", unitName)
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "  2. SUPERVISOR / MANUAL RUN:")
+	fmt.Fprintf(os.Stderr, "     %s\n", manualRun)
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintf(os.Stderr, "agentcookie wizard: %s config written; daemon must be started manually on Linux\n", role)
 }

@@ -7,6 +7,8 @@ export default defineConfig({
   test: {
     environment: "node",
     include: [
+      "middleware.test.ts",
+      "next.config.test.ts",
       "app/**/*.test.ts",
       "app/**/*.test.tsx",
       "lib/**/*.test.ts",

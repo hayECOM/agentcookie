@@ -1,211 +1,283 @@
 # agentcookie
 
-Your agent runs on a Mac that isn't your daily driver. It needs to act as you on every site you're already logged into and against every API you've already authenticated. agentcookie keeps your second Mac's session state (Chrome cookies, per-CLI bearer tokens, API keys, and the auth blobs your tools persist next to them) in sync with your first Mac's, continuously, encrypted over your Tailscale tailnet, with zero per-site auth ceremony.
+Your agent runs on a Linux box (a Grok Bot VM, a cloud agent runtime, a homelab server) and needs to act as you on every site you're already logged into. agentcookie keeps that box's Chrome session in sync with your Mac's, continuously, encrypted over your Tailscale tailnet, with zero per-site auth ceremony.
 
-OpenClaw, Hermes, or any other agent runtime you point at the second Mac wakes up authenticated, on the web and in the terminal.
+Cookie-authenticated sites show the logged-in UI after live CDP inject. Google/Workspace sessions stay logged out unless a human signed in on the box (DBSC binds those sessions to device keys). browserUse, Puppeteer, Playwright, or any Chromium automation that connects to Chrome's debug port sees your non-DBSC sessions already there.
 
 ## What it looks like
 
-You browse normally on your first Mac. agentcookie watches Chrome's Cookies file (and a parallel per-CLI secrets bus) and ships the diff to your second Mac the moment anything changes. On the second Mac, an agent does its work:
+You browse normally on your Mac. agentcookie watches Chrome's Cookies file and ships the diff to your Linux sink the moment anything changes. On the Linux box, an agent does its work:
 
 ```
-$ ssh second-mac 'instacart-pp-cli carts'
+$ ssh grok-bot 'python3 -c "
+from browser_use import BrowserUse
+with BrowserUse(cdp_url=\"http://127.0.0.1:9223\") as b:
+    print(b.page.goto(\"https://github.com/settings/profile\").title())
+"'
+Profile settings
+
+$ ssh grok-bot 'instacart-pp-cli carts'
   Costco                 slug=costco   cart=757109404 items=5
   Safeway                slug=safeway  cart=3190      items=1
-
-$ ssh second-mac 'ebay-pp-cli auctions "watch" --has-bids --ending-within 1h'
-12 active auctions:
-  $352   23 bids   1m   Apple Watch Ultra 2 49mm Titanium ...
-  $115   26 bids   1m   Gucci 5500M Steel Quartz ...
-  ...
-
-$ ssh second-mac 'table-reservation-goat-pp-cli goat "omakase" --location seattle'
-{ "results": [ { "name": "Omakase Dinner Series", "network": "tock", ... } ] }
 ```
 
-No `auth login`. No Keychain prompt. No paste-the-cookie ritual. No re-entering API keys you already configured on your laptop. The agent's sessions were already there when the request hit.
-
-The same is true for browser-driving agents and for any unmodified cookie tool. On a universal sink (the default), agentcookie writes your real Default Chrome profile and opens its Safe Storage key with a single login-password entry at install, so a tool that has never heard of agentcookie, yt-dlp, gallery-dl, a Polymarket CLI, a browser-driving agent, reads your synced, logged-in session with no per-tool setup. Prefer not to touch Chrome at all? Read the plaintext cookies sidecar at `~/.agentcookie/cookies-plain.db`, and the per-CLI secrets under `~/.agentcookie/secrets/<cli>/secrets.env`.
+No `auth login`. No paste-the-cookie ritual. The agent's session was already there when the request hit.
 
 ## What this fixes
 
-Logging in twice. Once on your laptop, once again on the Mac your agent lives on. Per site, per CLI, per API key. Forever.
+Logging in twice. Once on your Mac, once again on the Linux box where your agent runs. Per site, forever.
 
-Tools that ship cookies between machines today assume a human is going to click "merge" or unlock a vault or open the destination browser. They were built for switching accounts between two laptops the same person uses. They weren't built for "the agent on the headless Mac mini needs my session in 30 seconds and there's nobody home."
+Tools that ship cookies between machines today assume a human is going to click "merge" or unlock a vault or open the destination browser. They were built for switching accounts between two laptops the same person uses. They weren't built for "the agent on the Grok Bot VM needs my session in 30 seconds and there's nobody home."
 
-agentcookie is the second pattern. One-way, continuous, unattended replication from the machine you live in to the machine your agents act from. Pairing-derived per-peer keys, cookie policy filters on both sides, AES-256-GCM over the Tailscale tailnet's WireGuard channel. The hard parts (macOS Keychain protections, Chrome's App-Bound Encryption, per-CLI auth conventions) are handled.
+agentcookie is the second pattern. One-way, continuous, unattended replication from the Mac you live in to the Linux box your agents act from. Pairing-derived per-peer keys, cookie policy filters on both sides, AES-256-GCM over the Tailscale tailnet's WireGuard channel. The hard parts (macOS Keychain protections, Chrome's App-Bound Encryption on the source, live CDP injection on the sink) are handled.
 
 ## How it works
 
 ```
-laptop                                              second Mac
-======                                              ==========
+Mac (source)                                       Linux (sink)
+============                                       ============
 
-Chrome cookies change      secrets bus change
-(fsnotify on Cookies)      (fsnotify on ~/.agentcookie/
-  |                         secrets/<cli>/secrets.env,
-  |                         or autodiscovered via
-  |                         agentcookie.toml manifests)
-  |                                |
-  +--------------+-----------------+
-                 |
-                 v
-agentcookie source --watch  (decrypt Chrome with Keychain key,
-                             filter against cookie policy, fold in
-                             secrets bus payload)
-                 |
-                 v
-+----- HTTPS over Tailscale (AES-256-GCM, replay-defended) -----+
-                                                                |
-                                                                v
-                                              agentcookie sink (LaunchAgent)
-                                                |
-                                                | cookie delivery surfaces:
-                                                v
-                                              1. Chrome's Cookies SQLite (re-encrypted for sink Keychain)
-                                              2. Plaintext sidecar at ~/.agentcookie/cookies-plain.db
-                                                 (env var: AGENTCOOKIE_PLAIN_COOKIES)
-                                              3. Per-CLI adapter fan-out:
-                                                   instacart  -> session.json
-                                                   airbnb     -> config.toml + cookies.json
-                                                   ebay       -> config.toml + cookies.json
-                                                   pagliacci  -> config.toml + cookies.json
-                                                   table-reservation-goat -> session.json
-                                              4. cmux WebKit browser (opt-in) via
-                                                   cmux rpc browser.cookies.set
+Chrome cookies change
+(fsnotify on Cookies)
+  |
+  v
+agentcookie source --watch
+  - read SQLite (RO)
+  - decrypt w/ Keychain key
+  - filter by cookie policy
+  - wrap in envelope
+  - seal w/ peer key
+  |
+  +-- HTTPS over Tailscale (AES-256-GCM) ---------->  agentcookie sink
+                                                        - listen 100.x:9999/sync
+                                                        - decrypt seal
+                                                        - filter by policy
+                                                        - CDP attach to Chrome
+                                                        - Storage.setCookies per
+                                                          browser context
 
-                                              plus the secrets bus mirror:
-                                                ~/.agentcookie/secrets/<cli>/secrets.env  (mode 0600,
-                                                  optional sealed twin under the v0.12 master key)
+No Keychain on Linux. No Chrome SQLite rewrite. Just live CDP injection.
 ```
 
-Multiple cookie surfaces because different agents read cookies differently. Universal delivery (surface 1, the real Default profile plus the one-password Safe Storage open) is the default and is what makes any unmodified cookie tool work; the sidecar (surface 2) and per-CLI adapters (surface 3) are the agentcookie-aware paths that also work in degraded mode, when no login password is available to open the key. The sink runs surfaces 1 through 3 after every sync, so the agent picks what fits.
-
-Surface 4 is the opt-in cmux surface. cmux ([cmux.com](https://cmux.com)) ships its own embedded browser on Apple WebKit with a cookie jar separate from Chrome's, so none of the other surfaces reach it. Enable it and the sink injects the synced session into cmux's browser after every sync (`cmux rpc browser.cookies.set`), so an agent driving cmux's browser pane wakes up authenticated. Injected cookies persist at cmux's profile level, so one injection carries to the agent's later panes. See [cmux delivery](#cmux-delivery-opt-in).
-
-Bearer tokens, API keys, and other per-CLI auth blobs ride the same encrypted push and land at `~/.agentcookie/secrets/<cli>/secrets.env` on the sink. CLIs read them via environment variables, the in-process `pkg/agentcookiesecret` Go library, or a project's own `agentcookie.toml` manifest (see the adoption standard below).
-
-New cookie adapters are roughly 50 lines of Go and a `Register()` call; the runbook walks through it. New secrets bus consumers usually require no agentcookie-side change at all: drop an `agentcookie.toml` next to your CLI and `agentcookie discover` finds it.
-
-## cmux delivery (opt-in)
-
-cmux's browser is Apple WebKit, with a cookie jar separate from Chrome's, so it needs its own surface. Enable it in `sink.yaml`:
-
-```yaml
-cmux:
-  enabled: true
-  # cmux_path: /custom/path/to/cmux   # optional; default resolves the app bundle, then PATH
-  # domain_filter:                     # optional; SQLite-LIKE host_key patterns. empty = all synced cookies
-  #   - "%github.com"
-  #   - "%openai.com"
-```
-
-One required cmux-side step: cmux's RPC socket defaults to `socketControlMode: "cmuxOnly"`, which only accepts processes started inside cmux. The agentcookie sink is a LaunchAgent, not a cmux child, so with the default it is rejected and no cookies land. Open the socket to the sink:
-
-```jsonc
-// ~/.config/cmux/cmux.json
-{
-  "automation": {
-    "socketControlMode": "allowAll"   // or "password" (then set automation.socketPassword)
-  }
-}
-```
-
-Then fully restart cmux (Quit and reopen). The mode is read only at app launch; `cmux reload-config` does not apply it. Verify with `cmux capabilities | grep access_mode` (it should no longer say `cmuxOnly`), or just run `agentcookie doctor`, which reports the cmux delivery surface and prints this exact remediation when the gate is still closed.
-
-Caveats: the surface delivers cookies only, so sites whose session also lives in localStorage/IndexedDB or is device-bound (DBSC, e.g. Google/Workspace) may still need a one-time sign-in inside the cmux pane; WebKit's ITP can also drop some cross-site cookies. The surface is best-effort and non-fatal: if cmux is not running or still gated, the sync and the other three surfaces are unaffected.
-
-### Local loop (one machine, no sink)
-
-The sink surface above is for the two-machine model. If you just want *this* Mac's Chrome logins to flow into *this* Mac's cmux browser, use the local loop instead. No second machine, no Tailscale, no pairing.
-
-**On by default when cmux is installed.** `agentcookie wizard install` detects cmux and turns the loop on automatically: it sets cmux's `socketControlMode` to `allowAll`, installs a launch agent that runs `cmux-sync --watch` over your full cookie set, and tells you to **restart cmux once** to activate (the mode is read only at app launch). After that single restart it stays in sync hands-free. Opt out with `agentcookie wizard install --no-cmux`. Turn it on/off later with `agentcookie cmux-sync enable` / `disable`. `agentcookie doctor` reports the loop's liveness (enabled / needs-restart / live).
-
-For manual or one-shot use:
-
-```bash
-# one-shot: read Chrome now, inject into cmux
-agentcookie cmux-sync --once
-
-# continuous: re-inject whenever Chrome cookies change (fsnotify)
-agentcookie cmux-sync --watch
-
-# narrow to specific sites
-agentcookie cmux-sync --watch --domain "%github.com" --domain "%amazon%"
-```
-
-It reuses `source.yaml`'s Chrome path and cookie policy (so your block or allow rules still apply) and the same decrypt + DBSC filtering as `source`. Configure defaults under a `cmux:` block in `source.yaml` (same shape as the sink block above); flags override.
-
-Run model and the `cmuxOnly` gate:
-
-- **From inside cmux (recommended):** run `cmux-sync` in a cmux terminal. The process is a cmux child, so it passes the default `cmuxOnly` gate with no cmux change at all.
-- **Unattended (launchd):** a LaunchAgent is not a cmux child, so it needs `socketControlMode` set to `allowAll`/`password` and a cmux restart (same as the sink, above). `agentcookie doctor` reports the local loop's state and prints the fix.
-
-Keychain note: run the **installed, signed `agentcookie`** binary. Reading Chrome's Safe Storage key is a one-time Keychain grant for that signed binary (set up at `wizard install`), so it does not prompt. Running via `go run` or an unsigned/rebuilt binary will pop the macOS Keychain password prompt on every run, because the grant is scoped per binary.
-
-## Agent browsers (browser-use, agent-browser)
-
-cmux is WebKit. The Chromium agent browsers used for automation and HAR sniffing -- **browser-use** and vercel-labs **agent-browser** -- get their own loop: `agent-sync`. It launches a dedicated Chrome on a loopback debug port, reads this Mac's Chrome cookies (same decrypt + cookie policy + DBSC pipeline as `source`), and injects them -- as plaintext, over CDP -- into every browser context that Chrome opens, including the context a connector creates for itself. browser-use / agent-browser connect via `--cdp-url` and wake up logged into your sites.
-
-```bash
-agentcookie agent-sync                          # launch + sync, hold until Ctrl-C
-agentcookie agent-sync --headed                 # show the owned browser window
-agentcookie agent-sync --domain "%github.com"   # limit to matching hosts
-```
-
-It prints the connect commands for the running browser:
-
-```bash
-browser-use --cdp-url http://127.0.0.1:9400 open https://github.com
-agent-browser --cdp 9400
-```
-
-Why this works where copying cookies does not: this is **live injection into a running browser**, not a cold on-disk profile or a Playwright `storage_state` file. Cookies go straight into Chrome's in-memory store via CDP, so Chrome 127+ App-Bound Encryption -- which makes cold-profile cookies undecryptable on load -- never applies, and httpOnly + persistent session cookies (the real auth cookies, which Playwright's `addCookies` rejects) carry fine. The owned Chrome uses its own `--user-data-dir`, so the debug port is honored without the `chrome://inspect` toggle (Chrome 136+ only blocks the port on the *default* profile) and your everyday Chrome is never touched. Verified end to end: browser-use connected to `agent-sync` reads logged-in on github.com, including the login-gated `/settings/profile`.
-
-It re-injects whenever your Chrome cookies change (fsnotify, same loop `cmux-sync` uses) and injects each new context as it appears, so a site you log into in your real Chrome becomes logged-in in the agent browser without a restart.
-
-Limits: **device-bound (DBSC) cookies cannot transfer** to another browser -- Google/Workspace account cookies are the broad adopter -- so those sites may still read logged-out; everything else (the large majority) works. Sites whose auth lives in localStorage/IndexedDB rather than cookies are not yet carried (cookies-first; localStorage injection is a planned follow-up). Keychain note above applies (run the signed binary).
+The sink injects cookies directly into Chrome's in-memory store via the Chrome DevTools Protocol. Chrome on the Linux box must be started with `--remote-debugging-port=9223` (or another port you configure). The inject happens on every sync and on every new browser context, so an agent that launches a fresh tab inherits the session immediately.
 
 ## Install
 
-Prereqs: Tailscale running on both Macs, Chrome installed, Go 1.22+ (or a pre-built release).
+### Download release binaries
 
+From the [GitHub Releases](https://github.com/mvanhorn/agentcookie/releases/tag/v1.0.0) page, download the archive for your platform:
+
+| Platform | Archive |
+|----------|---------|
+| macOS arm64 | `agentcookie_1.0.0_darwin_arm64.tar.gz` |
+| Linux amd64 | `agentcookie_1.0.0_linux_amd64.tar.gz` |
+| Linux arm64 | `agentcookie_1.0.0_linux_arm64.tar.gz` |
+
+Verify against `checksums.txt`:
+
+```bash
+# On Mac
+curl -LO https://github.com/mvanhorn/agentcookie/releases/download/v1.0.0/agentcookie_1.0.0_darwin_arm64.tar.gz
+curl -LO https://github.com/mvanhorn/agentcookie/releases/download/v1.0.0/checksums.txt
+shasum -a 256 -c checksums.txt --ignore-missing
+
+tar -xzf agentcookie_1.0.0_darwin_arm64.tar.gz
+sudo mv agentcookie /usr/local/bin/
+
+# On Linux
+curl -LO https://github.com/mvanhorn/agentcookie/releases/download/v1.0.0/agentcookie_1.0.0_linux_amd64.tar.gz
+curl -LO https://github.com/mvanhorn/agentcookie/releases/download/v1.0.0/checksums.txt
+sha256sum -c checksums.txt --ignore-missing
+
+tar -xzf agentcookie_1.0.0_linux_amd64.tar.gz
+sudo mv agentcookie /usr/local/bin/
 ```
-# On both machines:
-go install github.com/mvanhorn/agentcookie/cmd/agentcookie@latest
 
-# On the first Mac (source):
-agentcookie wizard install --as source --peer <second-mac-hostname>
+Or build from source after the tag:
 
-# It prints a pairing code. On the second Mac (sink), paste:
-agentcookie wizard install --as sink --peer <first-mac-hostname> \
-  --code <pairing-code> --pair-url http://<first-mac-hostname>:9998/pair
+```bash
+go install github.com/mvanhorn/agentcookie/cmd/agentcookie@v1.0.0
 ```
 
-The sink wizard installs a LaunchAgent, opens Chrome Safe Storage for universal delivery with one login-password entry over SSH (no GUI click), and registers the five built-in adapters that fire after every sync. If no password is available (a fully non-interactive install with no `AGENTCOOKIE_LOGIN_PASSWORD`), it lands in degraded mode (sidecar + adapters) and prints the one-line `agentcookie wizard set-keychain-access` upgrade command. After install, all sync work runs unattended.
+### Prereqs
 
-See [docs/quickstart.md](docs/quickstart.md) for the long-form walkthrough and [docs/quickstart-beta.md](docs/quickstart-beta.md) for the headless flow if you're installing the second Mac over SSH.
+- Tailscale running on both machines
+- Chrome installed on both machines
+- On Linux: Chrome started with `--remote-debugging-port=9223`
 
-## Verify it's working
+### Mac source setup
 
+```bash
+# 1. Run the source wizard (interactive)
+agentcookie wizard install --as source --peer <linux-tailscale-hostname>
+
+# The wizard prints a pairing code and URL. Keep this terminal open.
+# Example output:
+#   Pairing code: ABCD-EFGH-IJKL
+#   Pair URL: http://your-mac.tailnet:9998/pair
+#   Waiting for sink to pair...
 ```
-agentcookie doctor                           # both sides' health
-agentcookie wizard verify-adapters           # per-adapter results from the last sync
-agentcookie wizard verify-adapters --json    # same, structured for SSH agents
+
+### Linux sink setup (featured: Grok Bot / trusted single-operator box)
+
+Do NOT run `wizard install --as sink` on Linux. The wizard omits the policy file, which means allowlist-empty (ship nothing). Instead, write the YAML files directly:
+
+```bash
+# 2. Create the config directory
+mkdir -p ~/.config/agentcookie
+
+# 3. Write sink.yaml
+cat > ~/.config/agentcookie/sink.yaml << 'EOF'
+listen:
+  # Use your current Tailscale IP. After Tailscale re-auth, if this IP
+  # becomes stale, the sink auto-rebinds to the new 100.x address.
+  addr: 100.x.y.z:9999
+
+peer:
+  hostname: your-mac.tailnet  # Mac's Tailscale hostname
+
+live_cdp:
+  enabled: true
+  endpoint: http://127.0.0.1:9223  # Chrome's debug port
+
+skip_chrome_sqlite: true
+EOF
+
+# 4. Write blocklist.yaml for sync-all on a trusted box
+cat > ~/.config/agentcookie/blocklist.yaml << 'EOF'
+version: 1
+policy: blocklist
+domains: []
+EOF
+
+# 5. Pair with the Mac source
+agentcookie pair --as sink \
+  --peer your-mac.tailnet \
+  --code ABCD-EFGH-IJKL \
+  --pair-url http://your-mac.tailnet:9998/pair
 ```
 
-Turn cookie sync off or back on for a site without editing YAML:
+Replace:
+- `100.x.y.z` with your current Tailscale IP (`tailscale ip -4`). If Tailscale re-auth gives the sink a new IP, the sink auto-rebinds to it on next start.
+- `your-mac.tailnet` with your Mac's Tailscale hostname (`tailscale status` on either machine)
+- The pairing code and URL with the values printed by the Mac source wizard
 
-~~~bash
-agentcookie accounts off x.com          # add x.com + subdomains to blocklist.yaml
-agentcookie accounts on x.com           # remove those blocklist entries
-agentcookie accounts list               # show disabled domains and custom patterns
-~~~
+### Linux CDP source (existing browser; no SQLite access)
 
-By default `blocklist.yaml` is an opt-out filter: omitted `policy`, a missing
-file, or an empty domains list preserves sync-all behavior. For a high-trust
-agent runtime where you only want specific browser sessions to leave the source
-machine, make the policy explicit:
+When the authenticated browser already runs on Linux, set `cdp_source` in its
+**source** configuration. AgentCookie reads the live jar through CDP, applies
+the existing `blocklist.yaml`, and sends the normal paired encrypted envelope.
+It never opens, copies, or decrypts Chromium's SQLite database.
+
+```yaml
+# ~/.config/agentcookie/source.yaml
+sink:
+  url: http://your-sink.tailnet:9999/sync
+peer:
+  hostname: your-sink
+cdp_source:
+  enabled: true
+  endpoint: http://127.0.0.1:9230
+```
+
+The endpoint must be a bare `http` origin using a **literal loopback IP**
+(`127.0.0.1` or `::1`); hostnames such as `localhost` are rejected so a hosts
+or DNS override cannot redirect browser-control access off-host. Tailnet, LAN,
+public, credential-bearing, and path/query endpoints are rejected. CDP-source
+configuration is exclusive: do not set `chrome.db_path` or `browser`.
+`export`, `agent-sync`, and `cmux-sync` also read from the configured CDP
+endpoint in this mode, without falling back to another profile; their watch
+modes poll rather than watching a SQLite file. `source --once` reads once;
+`source --watch` polls every 10 seconds because CDP does not provide a
+cookie-change event. CDP-source mode carries cookies only: it deliberately does
+not scrape Local Storage or IndexedDB from an on-disk profile as a fallback.
+
+### Attach to the existing Chrome (or start one as fallback)
+
+On Grok Bot and most agent runtimes, Chrome is already running with a debug port. Probe before starting a new one:
+
+```bash
+# Check if Chrome is already listening on common debug ports
+for port in 9223 9222 9224 9228 9229; do
+  if curl -s "http://127.0.0.1:${port}/json/version" >/dev/null 2>&1; then
+    echo "Chrome found on port ${port}"
+    # Update sink.yaml to use this port
+    sed -i "s|endpoint: http://127.0.0.1:.*|endpoint: http://127.0.0.1:${port}|" \
+      ~/.config/agentcookie/sink.yaml
+    break
+  fi
+done
+```
+
+If no Chrome is listening, start one as a fallback:
+
+```bash
+# Only if no existing Chrome debug port was found
+google-chrome --remote-debugging-port=9223 &
+
+# Or headless
+google-chrome --remote-debugging-port=9223 --headless=new &
+```
+
+Starting a second Chrome when one is already running on the same port causes conflicts (the KTD2 failure mode). Always probe first.
+
+You can also use `agentcookie doctor` which probes ports 9222, 9223, 9224, 9228, 9229, and 9400 and reports which endpoint is reachable.
+
+### Start the sink
+
+```bash
+agentcookie sink
+```
+
+For a persistent daemon, copy the systemd user unit printed by `agentcookie wizard install --as sink` on macOS (or write your own). Do not auto-install it; review and place it yourself:
+
+```bash
+mkdir -p ~/.config/systemd/user/
+# Paste the unit content
+systemctl --user daemon-reload
+systemctl --user enable --now agentcookie-sink.service
+```
+
+### Verify
+
+```bash
+# On Mac
+agentcookie doctor
+agentcookie status --json
+
+# On Linux
+agentcookie doctor
+agentcookie status --json
+```
+
+On Linux, `doctor` reports expected FAILs for macOS-specific checks (codesign, Chrome.app path, launchctl). Look for:
+
+- `live_cdp: endpoint reachable` - must be OK
+- `tailnet: bind address` - must be OK
+- Status output with `LastWriteMode` containing `livecdp`
+- `live_cdp: injected N cookies into M context(s)` in sink output
+
+The message `wrote 0 cookies` for Chrome SQLite is expected on Linux. Success is the live CDP inject line.
+
+## Cookie policy
+
+### Linux defaults to allowlist-empty (ship nothing)
+
+On Linux, a missing `blocklist.yaml` or omitted `policy:` field means the sink accepts no cookies. This is security-by-default for untrusted sinks.
+
+For a single-operator trusted box (like your own Grok Bot VM), the featured setup writes:
+
+```yaml
+version: 1
+policy: blocklist
+domains: []
+```
+
+This syncs all cookies. The 1.0 release does NOT change this default in code. A later release may flip the default, which would be a breaking change.
+
+### For multi-user or less-trusted sinks
+
+Use allowlist mode to sync only specific domains:
 
 ```yaml
 version: 1
@@ -213,95 +285,103 @@ policy: allowlist
 domains:
   - pattern: "github.com"
   - pattern: "%.github.com"
+  - pattern: "%.openai.com"
 ```
 
-Allowlist mode runs on both source and sink. Only matching `host_key` patterns
-sync; an empty allowlist syncs no cookie hosts. `agentcookie status` and
-`agentcookie doctor` report the active cookie policy, and `accounts on/off`
-remain blocklist-only helpers.
+## macOS sink (second Mac / Mac mini)
 
-Healthy output:
+macOS sinks are still supported. The wizard works:
 
-```
-ADAPTER                          STATUS  PUSHED  DETAIL
--------                          ------  ------  ------
-instacart-pp-cli                 ok      33
-airbnb-pp-cli                    ok      25
-ebay-pp-cli                      ok      51
-pagliacci-pp-cli                 skip            no matching cookies
-table-reservation-goat-pp-cli    ok      36
-
-last run: 4s ago
+```bash
+# On the second Mac
+agentcookie wizard install --as sink \
+  --peer <source-mac-hostname> \
+  --code <pairing-code> \
+  --pair-url http://<source-mac>:9998/pair
 ```
 
-## Status
+The macOS sink writes to Chrome's encrypted SQLite, the plaintext sidecar, and per-CLI adapter session files. It can also run CDP injection into a managed Chrome subprocess. See [docs/quickstart.md](docs/quickstart.md) for the full macOS-to-macOS walkthrough.
 
-The source is macOS only (it reads Chrome via the macOS Keychain-backed decrypt path). The sink runs on macOS or Linux:
+## Fan out to multiple sinks
 
-- **macOS sink**: full two-machine continuous sync via Tailscale `/sync`. Writes Chrome SQLite + plaintext sidecar + per-CLI adapters. LaunchAgent for unattended sync.
-- **Linux sink** (new in v0.14): continuous sync via Tailscale `/sync`, with live CDP injection into a running Chrome. This is the Grok Bot / agent-runtime path: the Linux box wakes up logged into source-allowlisted sites without a second login. No Chrome SQLite rewrite, no Keychain, no libsecret — just live CDP injection into Chrome started with `--remote-debugging-port`. The Linux sink MUST bind a Tailscale 100.x address; it will not start without a tailnet. Security: missing policy defaults to allowlist-empty (ship nothing) on Linux, so the operator must explicitly configure which domains sync.
+One source can push the same cookies and secrets to several sinks. A source push reads and filters your cookies once, then seals and POSTs to each sink independently with that sink's own paired key. A sink that is down or unreachable is isolated: it fails on its own while the other sinks still receive the payload.
 
-Working:
+List sinks under `sinks:` in `source.yaml`, each with its own `url` and `peer`:
 
-- Continuous laptop to second-Mac sync via fsnotify on Chrome's Cookies file, debounced, cookie-policy filtered, AES-256-GCM over Tailscale.
-- Three cookie delivery surfaces on the sink (Chrome SQLite, plaintext sidecar, per-CLI adapter session files).
-- Works with Printing Press CLIs like Stripe, Linear, Notion, Granola, Slack, Kalshi, ElevenLabs, Mercury, and dozens more: anything with a bearer token or API key reads the secrets bus, anything that reads cookies reads the plaintext sidecar. Five PP CLIs (instacart, airbnb, ebay, pagliacci, table-reservation-goat with OpenTable + Tock) additionally get a bespoke zero-config cookie adapter.
-- Per-CLI secrets bus: bearer tokens, API keys, and `KEY=VALUE` auth blobs ride the same encrypted push and land at `~/.agentcookie/secrets/<cli>/secrets.env` (mode 0600) with an optional sealed twin.
-- `agentcookie secret list / get / set / rm / revoke / import-from / env` for managing the bus, and `pkg/agentcookiesecret` as an in-process Go reader library.
-- v2 adoption standard: drop an `agentcookie.toml` in your repo and `agentcookie discover` auto-detects it. Three integration tiers (explicit-manifest, pp-cli-derived auto-synthesized from `.printing-press.json`, and legacy v1 directories) coexist.
-- Tailnet-only listeners on both ends; pair endpoint rate-limited with a 64-bit code.
-- Persistent replay defense; per-peer pairing-derived keys.
-- Universal cookie delivery: one macOS login-password entry at install (no GUI click) opens the sink's Chrome Safe Storage key to any cookie reader via a partition list (`apple-tool:,apple:,teamid:<your-team>`), so unmodified cookie tools (yt-dlp, gallery-dl, browser-driving agents, the Printing Press CLIs) read the real synced Default Chrome profile. Verified live on macOS 15.x.
-- Apple Developer ID signed binaries; the sink daemon reads Chrome Safe Storage via the `teamid:` partition (no per-binary trust list, no recreate of the key value).
-- Headless second-Mac install over SSH: one login-password entry, no GUI SecurityAgent click. A box with no password available installs in degraded mode (sidecar + adapters still work) and prints the one-line upgrade command.
-- `agentcookie doctor` runs fifteen health categories including cookie delivery (universal vs degraded, with duplicate-keychain-item race detection), binary signature + install, Tailscale, config, keystore, listener bind, sink/source state, sealing posture, adapter coverage, CDP injector health, secrets-bus + secret coverage, and DBSC-suspect cookies.
-- 520+ unit tests across 26 packages.
+```yaml
+sinks:
+  - url: http://mac-mini.tailnet.ts.net:9999/sync
+    peer: mac-mini
+  - url: http://grok-bot.tailnet.ts.net:9999/sync
+    peer: grok-bot
+chrome:
+  db_path: ~/Library/Application Support/Google/Chrome/Default/Cookies
+```
 
-Not yet:
+A legacy single-sink `source.yaml` (top-level `sink:` + `peer:`) keeps working unchanged and behaves as a one-element list. To pair and append another sink without hand-editing:
 
-- Python reader library at `clients/python/agentcookie_secret` (planned; the Go reader ships today).
-- Signature verification on adoption manifests (`signed_by` field reserved; v2.1).
-- `[secrets.command]` and `[secrets.keychain]` source kinds (reserved; v2.1).
-- `agentcookie pair --rotate` for live key rotation. Today: re-run `wizard install` on both sides.
-- One first-Mac, many second-Macs fan-out.
-- At-rest sealing of the sidecar + adapter session files is wired in but off by default; turns on via `wizard set-keychain-access --enable-sealing` once consumer-side support lands.
+```bash
+agentcookie wizard install --as source --add-sink \
+  --peer <new-sink-hostname> \
+  --sink-url http://<new-sink>.tailnet.ts.net:9999/sync
+```
+
+`agentcookie status` and `agentcookie doctor` report each sink's last push and failures. See [examples/source-multi-sink.yaml](examples/source-multi-sink.yaml).
+
+**Trust note:** every sink receives the same full cookie and secret set, so a compromise of the least-trusted sink exposes everything. Only list sinks you trust with the whole payload. To stop feeding a sink, remove its entry from `sinks:` and delete its `keys/<peer>.json`. The device-bound (DBSC) caveat below is per-sink and unchanged: each sink still needs its own Chrome signed into the same Google account.
 
 ## What about Chrome's device-bound cookies (DBSC)?
 
-Chrome's Device Bound Session Credentials (DBSC) tie a session to one machine's secure hardware so a stolen cookie cannot be replayed elsewhere. That is exactly the "move a cookie to another machine" shape agentcookie is built on, so it is worth being precise about what DBSC does and does not change here.
+Chrome's Device Bound Session Credentials (DBSC) tie a session to one machine's secure hardware so a stolen cookie cannot be replayed elsewhere. For a site that has adopted DBSC, a copied cookie works on the sink only until its short-lived window (minutes) lapses.
 
-DBSC is opt-in per site. A cookie becomes device-bound only when the site's own backend asks for it; nothing binds automatically, and a site binds only the specific session cookies it nominates. As of May 2026 the one broad adopter is Google's own account and Workspace cookies, and that protection went generally available on Chrome for Windows first. macOS support began rolling out gradually in the next Chrome release. The vast majority of sites agentcookie syncs, and every Printing Press CLI it feeds, do not use DBSC, so their cookies replicate to the second Mac and keep working exactly as before.
+As of August 2026, the one broad adopter is Google's own account and Workspace cookies. The vast majority of sites, and every Printing Press CLI agentcookie feeds, do not use DBSC and sync as before.
 
-For a site that has adopted DBSC, a copied cookie works on the second Mac only until its short-lived window (minutes) lapses, because the second Mac cannot sign the refresh challenge that the source Mac's Secure Enclave holds. agentcookie does not try to defeat that. Instead the source flags cookies that look device-bound and, by default, ships them with a warning you can see in `agentcookie doctor`. Pass `--skip-dbsc-suspect` (or set `AGENTCOOKIE_SKIP_DBSC_SUSPECT=1`) to drop them instead of shipping cookies that will not survive on the sink.
+For Google sessions: sign the sink's Chrome into the same Google account once. It establishes its own device-bound session locally, no cookie copy required.
 
-Two things blunt the impact:
+The secrets bus (bearer tokens, API keys, OAuth refresh tokens) is untouched by DBSC and replicates normally.
 
-- The secrets bus is untouched. DBSC is a cookie protocol. Bearer tokens, API keys, and OAuth refresh tokens that ride the bus to `~/.agentcookie/secrets/<cli>/secrets.env` are outside its scope and replicate normally.
-- For Google sessions specifically, copying cookies was never the right tool. Sign the second Mac's Chrome into the same Google account once and it establishes its own device-bound session there, no copy required. The agent on the sink reads that local session.
+## Status
 
-In short: DBSC narrows one corner of the web (today, mostly Google) and agentcookie is honest about it, while the bulk of what it syncs, non-DBSC site cookies and the entire secrets bus, is unaffected. See [docs/threat-model.md](docs/threat-model.md) for the full treatment.
+### Working today
+
+- Mac to Linux continuous sync via Tailscale `/sync`
+- Mac to Mac continuous sync (second Mac, Mac mini)
+- Live CDP injection on Linux (cookies go into Chrome's in-memory store)
+- Three cookie delivery surfaces on macOS sink (Chrome SQLite, plaintext sidecar, per-CLI adapters)
+- Extra Chrome profile discovery: Mac profiles (Profile 1, Profile 2, etc.) are auto-discovered and decrypted; extra-profile cookies flow to sidecar, adapters, and live CDP alongside Default profile cookies
+- Sink adapters union extra-profile cookies through the same blocklist policy
+- Per-CLI secrets bus for bearer tokens and API keys
+- 520+ unit tests across 26 packages
+
+### Honest limits
+
+- Linux sink writes 0 cookies to Chrome SQLite (expected; success is live CDP inject)
+- Omitted cookie policy on Linux ships nothing (explicit `policy: blocklist` required for sync-all)
+- CDP port is loopback-only; same-user processes can attach and read injected cookies
+- Sidecar at `~/.agentcookie/cookies-plain.db` is plaintext at rest (not a success metric; verify with live CDP)
+- Google/DBSC cookies need local sign-in on the sink; copied cookies expire in minutes
+- Linux extra-profile Chrome SQLite stays unread (no libsecret); discovery and doctor/status name stores, but decryption requires macOS Keychain
+- No live key rotation yet; re-run wizard on both sides to rotate
+- Cookie values never appear in logs; do not use `cookies --json` as a verify step
+
+### Not yet
+
+- One source to many sinks fan-out
+- Python reader library for the secrets bus
+- Signature verification on adoption manifests
 
 ## Documentation
 
 | Doc | Use |
 |---|---|
-| [Quickstart](docs/quickstart.md) | install on a laptop + second-Mac pair |
 | [Architecture](docs/architecture.md) | module layout, sync lifecycle, security boundaries |
 | [Protocol v1](docs/protocol.md) | wire format spec for future client implementations |
 | [Threat model](docs/threat-model.md) | what agentcookie does and does not protect against |
 | [FAQ](docs/faq.md) | common questions |
-| [Headless quickstart](docs/quickstart-beta.md) | SSH-only install on a headless second Mac |
-| [v0.13 one-password keychain runbook](docs/runbook-v0.13-one-password-keychain.md) | universal delivery: the one-password Safe Storage partition open, the duplicate-item race + converge, and the unsigned-CGO boundary |
-| [v0.10 keychain runbook](docs/runbook-v0.10-keychain-access.md) | legacy sink Keychain ACL setup (superseded by v0.13 for the grant path) |
-| [agent-sync runbook](docs/runbook-agent-sync.md) | log browser-use / agent-browser into your sites via live CDP injection; why cold profiles / storage_state fail |
-| [v0.11 adapter runbook](docs/runbook-v0.11-adapter-cookie-push.md) | adapter mechanism + how to write your own |
-| [v0.12 security runbook](docs/runbook-v0.12-security-hardening.md) | sealed master key, tailnet-only listeners, rate-limited pairing |
-| [v0.12 codesign runbook](docs/runbook-v0.12-codesign.md) | Developer ID signing, notarization, CI secrets, renewal |
-| [Secrets bus v1 spec](docs/spec-agentcookie-secrets-bus-v1.md) | wire format and on-disk layout for non-cookie auth |
-| [Secrets bus v2 adoption spec](docs/spec-agentcookie-secrets-bus-v2-adoption.md) | `agentcookie.toml` manifest format and discovery rules |
-| [Secrets bus adoption runbook](docs/runbook-secrets-bus-adoption.md) | migrating a CLI from imperative `secret import-from` to manifest-driven sync |
-| [gh shim worked example](docs/runbook-secrets-bus-gh-example.md) | 50-line bash shim consuming the bus from a non-PP CLI |
-| [Install skill](skill/SKILL.md) | Generic `SKILL.md` installer prompt for Claude Code, Codex, Cursor, OpenClaw, Hermes, or any shell-capable agent |
+| [Consumption](docs/consumption.md) | how tools read synced cookies and secrets on the sink |
+| [agent-sync runbook](docs/runbook-agent-sync.md) | browserUse / agent-browser via live CDP injection |
+| [Secrets bus v2 adoption spec](docs/spec-agentcookie-secrets-bus-v2-adoption.md) | `agentcookie.toml` manifest format |
+| [Install skill](skill/SKILL.md) | agent-executable installer prompt |
 
 ## License
 

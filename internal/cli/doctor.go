@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -21,6 +23,7 @@ import (
 	"github.com/mvanhorn/agentcookie/internal/config"
 	"github.com/mvanhorn/agentcookie/internal/keystore"
 	"github.com/mvanhorn/agentcookie/internal/launchd"
+	"github.com/mvanhorn/agentcookie/internal/livecdp"
 	"github.com/mvanhorn/agentcookie/internal/secretsbus"
 	"github.com/mvanhorn/agentcookie/internal/sinkpush"
 	"github.com/mvanhorn/agentcookie/internal/state"
@@ -110,7 +113,11 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 			return tsclient.RequireTailnetIP(context.Background())
 		},
 		LoadSourceState: func() (*state.SourceState, error) {
-			return state.LoadSource(state.SourcePath(home))
+			cfg, err := config.LoadSource(common.ConfigDir)
+			if err != nil {
+				return nil, err
+			}
+			return state.LoadSource(sourceStatePathForConfig(cfg, common.ConfigDir, home))
 		},
 		LoadSinkState: func() (*state.SinkState, error) {
 			return state.LoadSink(state.SinkPath(home))
@@ -253,6 +260,19 @@ func buildReport(d doctorDeps) DoctorReport {
 		})
 	}
 
+	// 10a. Live CDP endpoint (Linux sink primary injection path) -- verifies
+	// the configured live_cdp.endpoint is reachable. If not, probes common
+	// loopback debug ports to suggest the correct setting.
+	if sinkCfg != nil {
+		checks = append(checks, checkLiveCDPEndpoint(sinkCfg))
+	} else {
+		checks = append(checks, Check{
+			Name:     "Live CDP endpoint",
+			Severity: SeveritySkipped,
+			Detail:   "source-only install",
+		})
+	}
+
 	// 10b. cmux delivery (sink surface) -- verifies the opt-in cmux sink
 	// surface can reach cmux, and specifically that socketControlMode is
 	// not the default "cmuxOnly" that would reject the LaunchAgent sink.
@@ -309,6 +329,12 @@ func buildReport(d doctorDeps) DoctorReport {
 	// the on-PATH copy and the daemon's copy don't silently differ.
 	checks = append(checks, checkBinaryInstall())
 
+	// 13a. Daemon binary path. Warns if the daemon's configured binary
+	// differs from the binary running doctor. This catches the common
+	// install-time mistake where a LaunchAgent plist points at ~/bin/agentcookie
+	// while the user runs doctor from ~/go/bin/agentcookie, causing confusion.
+	checks = append(checks, checkDaemonBinaryPath(srcCfg, sinkCfg))
+
 	// 14. Cookie delivery (v0.13 universal cookie delivery) -- sink role
 	// only. Tells the operator whether ANY unmodified cookie CLI works on
 	// this box (universal) vs only agentcookie-aware tools (degraded).
@@ -321,6 +347,15 @@ func buildReport(d doctorDeps) DoctorReport {
 			Detail:   "source-only install",
 		})
 	}
+
+	// 15. Chrome stores -- lists discovered Chrome profile stores and
+	// skip reasons. Informational (INFO/OK), never FAIL.
+	// Include config's CDP.ProfileDir if set.
+	cdpProfileDir := ""
+	if sinkCfg != nil {
+		cdpProfileDir = sinkCfg.CDP.ProfileDir
+	}
+	checks = append(checks, checkChromeStores(cdpProfileDir))
 
 	exit := 0
 	for _, c := range checks {
@@ -440,6 +475,87 @@ func binaryInstallCheckFrom(candidates []string) Check {
 		Detail:      fmt.Sprintf("%d agentcookie binaries differ; the one on PATH may not be the one your daemon runs: %s", len(infos), strings.Join(paths, ", ")),
 		Remediation: "reinstall so every location is the same build, or delete the stale copy, so status/doctor reflect the running daemon",
 	}
+}
+
+// checkDaemonBinaryPath warns if the daemon's configured binary differs from
+// the binary running this doctor invocation. This catches install-time mistakes
+// where a LaunchAgent plist points at ~/bin/agentcookie while the operator
+// invokes doctor from ~/go/bin/agentcookie.
+func checkDaemonBinaryPath(srcCfg *config.SourceConfig, sinkCfg *config.SinkConfig) Check {
+	self, err := os.Executable()
+	if err != nil {
+		return Check{
+			Name:     "Daemon binary path",
+			Severity: SeveritySkipped,
+			Detail:   "could not determine this binary's path",
+		}
+	}
+	self, _ = filepath.EvalSymlinks(self)
+
+	var mismatches []string
+
+	// Check source daemon on macOS (Linux doesn't use LaunchAgents).
+	if srcCfg != nil && !config.IsLinux() {
+		daemonPath := extractLaunchAgentBinaryPath(launchd.Spec{Role: launchd.RoleSource})
+		if daemonPath != "" && daemonPath != self {
+			mismatches = append(mismatches, fmt.Sprintf("source daemon: %s", daemonPath))
+		}
+	}
+
+	// Check sink daemon on macOS.
+	if sinkCfg != nil && !config.IsLinux() {
+		daemonPath := extractLaunchAgentBinaryPath(launchd.Spec{Role: launchd.RoleSink})
+		if daemonPath != "" && daemonPath != self {
+			mismatches = append(mismatches, fmt.Sprintf("sink daemon: %s", daemonPath))
+		}
+	}
+
+	if len(mismatches) == 0 {
+		return Check{
+			Name:     "Daemon binary path",
+			Severity: SeverityOK,
+			Detail:   fmt.Sprintf("daemon binary matches this invocation (%s)", self),
+		}
+	}
+
+	return Check{
+		Name:        "Daemon binary path",
+		Severity:    SeverityWarn,
+		Detail:      fmt.Sprintf("this doctor runs from %s but daemon(s) configured to use: %s", self, strings.Join(mismatches, ", ")),
+		Remediation: "re-run `agentcookie wizard install` from the binary you want the daemon to use, or reinstall to a single location",
+	}
+}
+
+// extractLaunchAgentBinaryPath reads the plist file for the given spec and
+// extracts the first element of ProgramArguments (the binary path).
+func extractLaunchAgentBinaryPath(spec launchd.Spec) string {
+	plistPath, err := spec.Path()
+	if err != nil {
+		return ""
+	}
+	data, err := os.ReadFile(plistPath)
+	if err != nil {
+		return ""
+	}
+	// Simple extraction: find the first <string> after ProgramArguments.
+	// This is a pragmatic approach that avoids importing plist libraries.
+	_, afterKey, found := strings.Cut(string(data), "<key>ProgramArguments</key>")
+	if !found {
+		return ""
+	}
+	_, afterOpen, found := strings.Cut(afterKey, "<string>")
+	if !found {
+		return ""
+	}
+	binPath, _, found := strings.Cut(afterOpen, "</string>")
+	if !found {
+		return ""
+	}
+	// Resolve symlinks for comparison.
+	if resolved, err := filepath.EvalSymlinks(binPath); err == nil {
+		return resolved
+	}
+	return binPath
 }
 
 // --- individual checks ---
@@ -873,18 +989,42 @@ func checkSourceStateFrom(st *state.SourceState, err error) Check {
 		}
 	}
 	if st.TotalFailures > 0 {
+		detail := fmt.Sprintf("last push %s ago, %d total failures", age, st.TotalFailures)
+		if failing := failingSinkLabels(st); failing != "" {
+			detail += fmt.Sprintf(" (failing sink(s): %s)", failing)
+		}
 		return Check{
 			Name:        "Source state",
 			Severity:    SeverityWarn,
-			Detail:      fmt.Sprintf("last push %s ago, %d total failures", age, st.TotalFailures),
+			Detail:      detail,
 			Remediation: "inspect `agentcookie status` for the most recent error",
 		}
+	}
+	detail := fmt.Sprintf("last push %s ago, 0 failures", age)
+	if n := len(st.Sinks); n > 1 {
+		detail += fmt.Sprintf(", %d sinks all healthy", n)
 	}
 	return Check{
 		Name:     "Source state",
 		Severity: SeverityOK,
-		Detail:   fmt.Sprintf("last push %s ago, 0 failures", age),
+		Detail:   detail,
 	}
+}
+
+// failingSinkLabels lists the peer/URL of each fan-out sink whose most
+// recent push failed, for the per-sink detail on the source-state WARN.
+func failingSinkLabels(st *state.SourceState) string {
+	var labels []string
+	for _, s := range st.Sinks {
+		if s.TotalFailures > 0 && s.LastError != "" {
+			label := s.URL
+			if s.Peer != "" {
+				label = s.Peer
+			}
+			labels = append(labels, label)
+		}
+	}
+	return strings.Join(labels, ", ")
 }
 
 // checkDBSCFrom is informational: it surfaces how many cookies the last push
@@ -1254,6 +1394,88 @@ func checkCDPInjector(sinkCfg *config.SinkConfig) Check {
 	}
 }
 
+// checkLiveCDPEndpoint verifies the Linux sink's live CDP injection endpoint
+// is reachable. When live_cdp.enabled is true, this is the primary injection
+// path: the sink attaches to an already-running Chrome via CDP. If the
+// configured endpoint is not reachable, probes common debug ports to help
+// the operator set live_cdp.endpoint correctly.
+func checkLiveCDPEndpoint(sinkCfg *config.SinkConfig) Check {
+	return checkLiveCDPEndpointWith(sinkCfg, probeCDPEndpoint)
+}
+
+// checkLiveCDPEndpointWith is the testable core over an injected probe.
+func checkLiveCDPEndpointWith(sinkCfg *config.SinkConfig, probe func(endpoint string) error) Check {
+	if !sinkCfg.LiveCDP.Enabled {
+		return Check{
+			Name:     "Live CDP endpoint",
+			Severity: SeveritySkipped,
+			Detail:   "live_cdp.enabled is false",
+		}
+	}
+
+	endpoint := sinkCfg.LiveCDP.Endpoint
+	if endpoint == "" {
+		endpoint = livecdp.DefaultCDPEndpoint
+	}
+
+	if err := probe(endpoint); err == nil {
+		return Check{
+			Name:     "Live CDP endpoint",
+			Severity: SeverityOK,
+			Detail:   fmt.Sprintf("live CDP endpoint %s is reachable", endpoint),
+		}
+	}
+
+	// Configured endpoint not reachable. Probe common debug ports to help.
+	commonPorts := []string{
+		"http://127.0.0.1:9222",
+		"http://127.0.0.1:9223",
+		"http://127.0.0.1:9224",
+		"http://127.0.0.1:9228",
+		"http://127.0.0.1:9229",
+		"http://127.0.0.1:9400",
+	}
+	var reachable []string
+	for _, ep := range commonPorts {
+		if ep == endpoint {
+			continue
+		}
+		if probe(ep) == nil {
+			reachable = append(reachable, ep)
+		}
+	}
+
+	if len(reachable) > 0 {
+		return Check{
+			Name:        "Live CDP endpoint",
+			Severity:    SeverityWarn,
+			Detail:      fmt.Sprintf("configured endpoint %s is not reachable, but found Chrome at: %s", endpoint, strings.Join(reachable, ", ")),
+			Remediation: fmt.Sprintf("set live_cdp.endpoint in sink.yaml to one of the reachable ports (e.g. %s)", reachable[0]),
+		}
+	}
+
+	return Check{
+		Name:        "Live CDP endpoint",
+		Severity:    SeverityFail,
+		Detail:      fmt.Sprintf("live_cdp.enabled but endpoint %s is not reachable; no Chrome with --remote-debugging-port found on common ports", endpoint),
+		Remediation: "start Chrome with --remote-debugging-port=9223 (or 9222/9228), then re-run doctor; or set live_cdp.endpoint to the actual port in sink.yaml",
+	}
+}
+
+// probeCDPEndpoint checks if the CDP endpoint responds to /json/version.
+func probeCDPEndpoint(endpoint string) error {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(endpoint + "/json/version")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // checkCookieDelivery (v0.13 universal cookie delivery) reports whether
 // ANY unmodified cookie CLI works on this sink, or only agentcookie-aware
 // tools. Universal delivery requires two facts to both hold:
@@ -1363,6 +1585,116 @@ func checkCookieDeliveryWith(sinkCfg *config.SinkConfig, probe func() (int, erro
 		Severity:    SeverityWarn,
 		Detail:      "partial: real Default profile written but the Chrome Safe Storage key has not been granted to cookie readers; unmodified cookie CLIs can't decrypt synced cookies",
 		Remediation: onePasswordGrantRemediation,
+	}
+}
+
+// checkChromeStores lists discovered Chrome profile stores and skip reasons.
+// This is the v0.8 feature that finds Chrome user-data-dirs beyond the
+// Default profile, including agent Chromes that have Cookies but no Local
+// State. Never FAIL; OK when stores found, INFO when stores skipped or on
+// Linux (no decrypt), SKIPPED when no Chrome detected.
+// profileDir is passed to DiscoverForConfig to include a configured CDP profile.
+func checkChromeStores(profileDir string) Check {
+	result := chromepaths.DiscoverForConfig(profileDir)
+
+	if len(result.Stores) == 0 && len(result.Skipped) == 0 {
+		return Check{
+			Name:     "Chrome stores",
+			Severity: SeveritySkipped,
+			Detail:   "no Chrome profile directories detected",
+		}
+	}
+
+	// On Linux, we can discover stores but can't decrypt them.
+	if runtime.GOOS == "linux" {
+		var storeNames []string
+		for _, s := range result.Stores {
+			label := s.Browser + "/" + s.Profile
+			if s.IsDefault {
+				label += " (default)"
+			}
+			storeNames = append(storeNames, label)
+		}
+		if len(storeNames) > 3 {
+			storeNames = append(storeNames[:3], fmt.Sprintf("+%d more", len(result.Stores)-3))
+		}
+
+		detail := fmt.Sprintf("%d profile(s) found, decrypt not supported on Linux (sidecar-only)", len(result.Stores))
+		if len(storeNames) > 0 {
+			detail = fmt.Sprintf("%d profile(s) found: %s; decrypt not supported on Linux (sidecar-only)",
+				len(result.Stores), strings.Join(storeNames, ", "))
+		}
+
+		return Check{
+			Name:     "Chrome stores",
+			Severity: SeverityInfo,
+			Detail:   detail,
+		}
+	}
+
+	// Darwin: list stores and note which are readable.
+	var readable, unreadable []string
+	for _, s := range result.Stores {
+		label := s.Browser + "/" + s.Profile
+		if s.IsDefault {
+			label += " (default)"
+		}
+		// Try to get the decrypt key for this browser.
+		browser, err := chrome.LookupBrowser(s.Browser)
+		if err != nil {
+			unreadable = append(unreadable, label+": unsupported browser")
+			continue
+		}
+		_, err = chrome.SafeStoragePasswordFor(browser)
+		if err != nil {
+			if chrome.IsKeychainLocked(err) {
+				unreadable = append(unreadable, label+": keychain locked")
+			} else {
+				unreadable = append(unreadable, label+": keychain access denied")
+			}
+			continue
+		}
+		readable = append(readable, label)
+	}
+
+	// Add skipped stores.
+	for _, s := range result.Skipped {
+		label := s.Profile
+		if s.Root != "" {
+			label = filepath.Base(s.Root) + "/" + s.Profile
+		}
+		unreadable = append(unreadable, label+": "+s.Reason)
+	}
+
+	// Truncate long lists.
+	if len(readable) > 5 {
+		readable = append(readable[:5], fmt.Sprintf("+%d more", len(result.Stores)-5))
+	}
+	if len(unreadable) > 3 {
+		unreadable = append(unreadable[:3], fmt.Sprintf("+%d more", len(result.Skipped)+len(result.Stores)-len(readable)-3))
+	}
+
+	var parts []string
+	if len(readable) > 0 {
+		parts = append(parts, fmt.Sprintf("readable: %s", strings.Join(readable, ", ")))
+	}
+	if len(unreadable) > 0 {
+		parts = append(parts, fmt.Sprintf("skipped: %s", strings.Join(unreadable, ", ")))
+	}
+
+	if len(readable) == 0 && len(unreadable) > 0 {
+		return Check{
+			Name:        "Chrome stores",
+			Severity:    SeverityWarn,
+			Detail:      fmt.Sprintf("0 readable store(s); %s", strings.Join(parts, "; ")),
+			Remediation: "grant agentcookie access to Chrome Safe Storage keychain, or use the sidecar",
+		}
+	}
+
+	return Check{
+		Name:     "Chrome stores",
+		Severity: SeverityOK,
+		Detail:   fmt.Sprintf("%d readable store(s); %s", len(readable), strings.Join(parts, "; ")),
 	}
 }
 

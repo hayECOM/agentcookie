@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 
@@ -20,8 +22,10 @@ import (
 	"github.com/mvanhorn/agentcookie/internal/chrome"
 	"github.com/mvanhorn/agentcookie/internal/config"
 	"github.com/mvanhorn/agentcookie/internal/protocol"
+	"github.com/mvanhorn/agentcookie/internal/secretsbus"
 	"github.com/mvanhorn/agentcookie/internal/state"
 	"github.com/mvanhorn/agentcookie/internal/transport"
+	"github.com/mvanhorn/agentcookie/internal/tsclient"
 )
 
 func TestSourcePushReloadsBlocklistBetweenPushes(t *testing.T) {
@@ -101,6 +105,143 @@ domains:
 	}
 	if got := fx.hostsAt(0); !reflect.DeepEqual(got, []string{"example.com", "www.example.com"}) {
 		t.Fatalf("allowlist push hosts = %v", got)
+	}
+}
+
+func TestCDPSourceStatePathIsScopedToConfigDirectory(t *testing.T) {
+	configDir := filepath.Join(t.TempDir(), "agentcookie-generic")
+	if got, want := sourceStatePath(true, configDir, "/irrelevant"), filepath.Join(configDir, "state", "source-state.json"); got != want {
+		t.Fatalf("CDP source state path = %q, want %q", got, want)
+	}
+	if got, want := sourceStatePathForConfig(&config.SourceConfig{CDPSource: config.CDPSourceRef{Enabled: true}}, configDir, "/irrelevant"), filepath.Join(configDir, "state", "source-state.json"); got != want {
+		t.Fatalf("configured CDP source state path = %q, want %q", got, want)
+	}
+	if got, want := sourceStatePathForConfig(nil, configDir, "/home/test"), state.SourcePath("/home/test"); got != want {
+		t.Fatalf("default source state path = %q, want %q", got, want)
+	}
+}
+
+func TestSourcePushCDPSourceAppliesAllowlistWithoutSQLiteFallback(t *testing.T) {
+	fx := newSourcePushFixture(t, nil)
+	fx.cfg.CDPSource = config.CDPSourceRef{Enabled: true, Endpoint: "http://127.0.0.1:9230"}
+	writeCLIFile(t, filepath.Join(fx.configDir, "blocklist.yaml"), `
+version: 1
+policy: allowlist
+domains:
+  - pattern: "example.com"
+  - pattern: "%.example.com"
+`)
+
+	previous := readCDPSource
+	readCDPSource = func(_ context.Context, endpoint string) ([]chrome.Cookie, error) {
+		if endpoint != "http://127.0.0.1:9230" {
+			t.Fatalf("endpoint = %q", endpoint)
+		}
+		return []chrome.Cookie{
+			{HostKey: "example.com", Name: "apex", Value: "a", Path: "/"},
+			{HostKey: "www.example.com", Name: "sub", Value: "s", Path: "/"},
+			{HostKey: "blocked.com", Name: "blocked", Value: "b", Path: "/"},
+		}, nil
+	}
+	t.Cleanup(func() { readCDPSource = previous })
+	previousSecrets := loadSecretsPayload
+	loadSecretsPayload = func(string) (*secretsbus.Payload, []error) {
+		t.Fatal("CDP source must not read the machine-wide secrets bus")
+		return nil, nil
+	}
+	t.Cleanup(func() { loadSecretsPayload = previousSecrets })
+
+	if _, err := fx.push(); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if got := fx.hostsAt(0); !reflect.DeepEqual(got, []string{"example.com", "www.example.com"}) {
+		t.Fatalf("CDP source pushed hosts = %v", got)
+	}
+	if got := fx.capture.envelopeAt(0).Secrets; len(got) != 0 {
+		t.Fatalf("CDP source transported secrets = %v, want none", got)
+	}
+}
+
+func TestSourcePushEmptyCycleRecordsHealthySourceState(t *testing.T) {
+	fx := newSourcePushFixture(t, nil)
+	statePath := filepath.Join(t.TempDir(), "source-state.json")
+	stateWriter := state.NewWriter(statePath)
+
+	n, err := pushWithFreshBlocklist(context.Background(), fx.cfg, fx.key, false, false, false, fx.srcState, stateWriter)
+	if err != nil {
+		t.Fatalf("empty push: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("empty push count = %d, want 0", n)
+	}
+	if got := fx.batchCount(); got != 0 {
+		t.Fatalf("empty push should not POST, got %d requests", got)
+	}
+	if got := fx.srcState.TotalPushes; got != 1 {
+		t.Errorf("TotalPushes = %d, want 1 after a successful empty cycle", got)
+	}
+	if fx.srcState.LastPush.IsZero() {
+		t.Fatal("LastPush should be recorded after a successful empty cycle")
+	}
+	if got := fx.srcState.LastPushCount; got != 0 {
+		t.Errorf("LastPushCount = %d, want 0", got)
+	}
+	if got := fx.srcState.TotalFailures; got != 0 {
+		t.Errorf("TotalFailures = %d, want 0", got)
+	}
+	persisted, err := state.LoadSource(statePath)
+	if err != nil {
+		t.Fatalf("load persisted source state: %v", err)
+	}
+	if persisted == nil {
+		t.Fatal("successful empty cycle did not persist source health")
+	}
+	if got := persisted.TotalPushes; got != 1 {
+		t.Errorf("persisted TotalPushes = %d, want 1", got)
+	}
+	if persisted.LastPush.IsZero() {
+		t.Error("persisted LastPush should be recorded after a successful empty cycle")
+	}
+	if got := persisted.LastPushCount; got != 0 {
+		t.Errorf("persisted LastPushCount = %d, want 0", got)
+	}
+}
+
+func TestSourcePushDryRunDoesNotRecordSourceHealth(t *testing.T) {
+	fx := newSourcePushFixture(t, []chrome.Cookie{
+		{HostKey: ".example.com", Name: "session", Value: "value", Path: "/"},
+	})
+	statePath := filepath.Join(t.TempDir(), "source-state.json")
+	stateWriter := state.NewWriter(statePath)
+
+	n, err := pushWithFreshBlocklist(context.Background(), fx.cfg, fx.key, true, false, false, fx.srcState, stateWriter)
+	if err != nil {
+		t.Fatalf("dry-run: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("dry-run push count = %d, want 0", n)
+	}
+	if got := fx.batchCount(); got != 0 {
+		t.Fatalf("dry-run should not POST, got %d requests", got)
+	}
+	if got := fx.srcState.TotalPushes; got != 0 {
+		t.Errorf("dry-run TotalPushes = %d, want 0", got)
+	}
+	if !fx.srcState.LastPush.IsZero() {
+		t.Fatal("dry-run should not update LastPush")
+	}
+	persisted, err := state.LoadSource(statePath)
+	if err != nil {
+		t.Fatalf("load dry-run state: %v", err)
+	}
+	if persisted == nil {
+		t.Fatal("dry-run should persist its non-health state envelope")
+	}
+	if got := persisted.TotalPushes; got != 0 {
+		t.Errorf("persisted dry-run TotalPushes = %d, want 0", got)
+	}
+	if !persisted.LastPush.IsZero() {
+		t.Errorf("persisted dry-run should not update LastPush, got %s", persisted.LastPush)
 	}
 }
 
@@ -228,8 +369,9 @@ func newSourcePushFixture(t *testing.T, cookies []chrome.Cookie) *sourcePushFixt
 	t.Cleanup(func() { http.DefaultTransport = oldTransport })
 
 	cfg := &config.SourceConfig{
-		Sink:   config.SinkRef{URL: "http://agentcookie-sink.test/sync"},
-		Chrome: config.ChromeRef{DBPath: dbPath},
+		Sink:     config.SinkRef{URL: "http://agentcookie-sink.test/sync"},
+		Chrome:   config.ChromeRef{DBPath: dbPath},
+		Security: config.SecurityRef{SharedSecret: secret},
 	}
 	return &sourcePushFixture{
 		configDir: configDir,
@@ -242,7 +384,7 @@ func newSourcePushFixture(t *testing.T, cookies []chrome.Cookie) *sourcePushFixt
 }
 
 func (f *sourcePushFixture) push() (int, error) {
-	return pushWithFreshBlocklist(context.Background(), f.cfg, f.key, f.secret, false, false, false, f.srcState, nil)
+	return pushWithFreshBlocklist(context.Background(), f.cfg, f.key, false, false, false, f.srcState, nil)
 }
 
 func (f *sourcePushFixture) batchCount() int {
@@ -254,9 +396,14 @@ func (f *sourcePushFixture) hostsAt(i int) []string {
 }
 
 type sourceCapture struct {
-	secret  string
-	mu      sync.Mutex
-	batches [][]chrome.Cookie
+	secret    string
+	mu        sync.Mutex
+	batches   [][]chrome.Cookie
+	urls      []string
+	envelopes []protocol.SyncEnvelope
+	// failURL, when non-empty, makes a POST to that exact URL return a
+	// non-200 so tests can exercise per-sink failure isolation.
+	failURL string
 }
 
 func newSourceCapture(t *testing.T, secret string) *sourceCapture {
@@ -267,6 +414,15 @@ func newSourceCapture(t *testing.T, secret string) *sourceCapture {
 func (c *sourceCapture) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.Method != http.MethodPost {
 		return nil, fmt.Errorf("unexpected method %s", req.Method)
+	}
+	if c.failURL != "" && req.URL.String() == c.failURL {
+		return &http.Response{
+			StatusCode: http.StatusInternalServerError,
+			Status:     "500 Internal Server Error",
+			Header:     make(http.Header),
+			Body:       io.NopCloser(bytes.NewBufferString("boom\n")),
+			Request:    req,
+		}, nil
 	}
 	sealed, err := io.ReadAll(req.Body)
 	if err != nil {
@@ -282,6 +438,8 @@ func (c *sourceCapture) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	c.mu.Lock()
 	c.batches = append(c.batches, append([]chrome.Cookie(nil), envelope.Cookies...))
+	c.urls = append(c.urls, req.URL.String())
+	c.envelopes = append(c.envelopes, envelope)
 	c.mu.Unlock()
 
 	return &http.Response{
@@ -293,10 +451,22 @@ func (c *sourceCapture) RoundTrip(req *http.Request) (*http.Response, error) {
 	}, nil
 }
 
+func (c *sourceCapture) postedURLs() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.urls...)
+}
+
 func (c *sourceCapture) batchCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.batches)
+}
+
+func (c *sourceCapture) envelopeAt(i int) protocol.SyncEnvelope {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.envelopes[i]
 }
 
 func (c *sourceCapture) batchAt(i int) []chrome.Cookie {
@@ -359,3 +529,171 @@ CREATE UNIQUE INDEX IF NOT EXISTS cookies_unique_index ON cookies(
 	host_key, top_frame_site_key, has_cross_site_ancestor, name, path, source_scheme, source_port
 );
 `
+
+// TestSourcePushAmbiguousPeerAbortsWithoutPOST verifies that when ResolveSinkURL
+// returns ErrAmbiguousPeer (multiple online peers share the hostname), the push
+// fails closed and does NOT fall back to the hostname URL. Falling back would
+// hand selection to MagicDNS and undo the fail-closed behavior.
+func TestSourcePushAmbiguousPeerAbortsWithoutPOST(t *testing.T) {
+	fx := newSourcePushFixture(t, []chrome.Cookie{
+		{HostKey: ".example.com", Name: "session", Value: "xyz", Path: "/"},
+	})
+
+	// Override the resolver to return ErrAmbiguousPeer.
+	restore := SetResolveSinkURLForTesting(func(ctx context.Context, rawURL string) (string, error) {
+		return rawURL, fmt.Errorf("%w: \"grok-bot\" has 2 online nodes with IPs [100.87.49.2 100.124.19.34]; pin sink.url to one 100.x IP or delete the leftover node from Tailscale admin",
+			tsclient.ErrAmbiguousPeer)
+	})
+	defer restore()
+
+	n, err := fx.push()
+	if err == nil {
+		t.Fatal("ambiguous peer should fail closed, got nil error")
+	}
+	if !errors.Is(err, tsclient.ErrAmbiguousPeer) {
+		t.Errorf("error should wrap ErrAmbiguousPeer, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "resolve sink URL") {
+		t.Errorf("error should mention 'resolve sink URL', got: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("ambiguous peer push count = %d, want 0", n)
+	}
+	if got := fx.batchCount(); got != 0 {
+		t.Fatalf("ambiguous peer should NOT send any HTTP request, got %d batches", got)
+	}
+	if fx.srcState.TotalFailures != 1 {
+		t.Errorf("TotalFailures = %d, want 1", fx.srcState.TotalFailures)
+	}
+}
+
+// TestSourcePushSoftResolveErrorFallsBackToHostname verifies that soft failures
+// (Tailscale CLI missing, peer not found, peer offline) fall back to the original
+// URL and proceed with the POST, letting HTTP report the connection error.
+func TestSourcePushSoftResolveErrorFallsBackToHostname(t *testing.T) {
+	fx := newSourcePushFixture(t, []chrome.Cookie{
+		{HostKey: ".example.com", Name: "session", Value: "xyz", Path: "/"},
+	})
+
+	// Override the resolver to return ErrPeerNotFound (a soft failure).
+	restore := SetResolveSinkURLForTesting(func(ctx context.Context, rawURL string) (string, error) {
+		return rawURL, fmt.Errorf("%w: \"unknown-host\"", tsclient.ErrPeerNotFound)
+	})
+	defer restore()
+
+	// Push should succeed (fall back to original URL, HTTP capture accepts it).
+	n, err := fx.push()
+	if err != nil {
+		t.Fatalf("soft resolve error should fall back to original URL, got: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("push count = %d, want 1", n)
+	}
+	if got := fx.batchCount(); got != 1 {
+		t.Fatalf("soft resolve error should still POST, got %d batches", got)
+	}
+}
+
+// --- Multi-sink fan-out (U2) and per-sink state (U3) ---
+
+func TestSourcePushFansOutToMultipleSinks(t *testing.T) {
+	fx := newSourcePushFixture(t, []chrome.Cookie{
+		{HostKey: ".example.com", Name: "s", Value: "v", Path: "/"},
+	})
+	// Two peerless sinks sharing the legacy secret (fixture bypasses
+	// LoadSource, which would otherwise require a per-sink credential).
+	urlA := "http://sink-a.test/sync"
+	urlB := "http://sink-b.test/sync"
+	fx.cfg.Sink = config.SinkRef{}
+	fx.cfg.Sinks = []config.SinkTarget{{URL: urlA}, {URL: urlB}}
+
+	if _, err := fx.push(); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if got := fx.batchCount(); got != 2 {
+		t.Fatalf("expected 2 POSTs (one per sink), got %d", got)
+	}
+	posted := fx.capture.postedURLs()
+	seen := map[string]bool{}
+	for _, u := range posted {
+		seen[u] = true
+	}
+	if !seen[urlA] || !seen[urlB] {
+		t.Fatalf("both sinks should have received the payload, got %v", posted)
+	}
+	// Per-sink state: two records, both with a successful push.
+	if n := len(fx.srcState.Sinks); n != 2 {
+		t.Fatalf("expected 2 per-sink state records, got %d", n)
+	}
+	for _, ps := range fx.srcState.Sinks {
+		if ps.TotalPushes != 1 || ps.TotalFailures != 0 {
+			t.Errorf("sink %s: expected 1 push 0 failures, got %+v", ps.URL, ps)
+		}
+	}
+}
+
+func TestSourcePushIsolatesFailedSink(t *testing.T) {
+	fx := newSourcePushFixture(t, []chrome.Cookie{
+		{HostKey: ".example.com", Name: "s", Value: "v", Path: "/"},
+	})
+	urlBad := "http://sink-bad.test/sync"
+	urlGood := "http://sink-good.test/sync"
+	fx.cfg.Sink = config.SinkRef{}
+	fx.cfg.Sinks = []config.SinkTarget{{URL: urlBad}, {URL: urlGood}}
+	fx.capture.failURL = urlBad
+
+	_, err := fx.push()
+	if err == nil {
+		t.Fatal("expected partial-failure error, got nil")
+	}
+	// The healthy sink still received the payload.
+	posted := fx.capture.postedURLs()
+	if len(posted) != 1 || posted[0] != urlGood {
+		t.Fatalf("healthy sink should have been delivered exactly once, got %v", posted)
+	}
+	// Per-sink state records the failure on the bad sink, success on the good.
+	var bad, good *state.SinkPushState
+	for i := range fx.srcState.Sinks {
+		switch fx.srcState.Sinks[i].URL {
+		case urlBad:
+			bad = &fx.srcState.Sinks[i]
+		case urlGood:
+			good = &fx.srcState.Sinks[i]
+		}
+	}
+	if bad == nil || bad.TotalFailures != 1 {
+		t.Errorf("bad sink should have 1 failure, got %+v", bad)
+	}
+	if good == nil || good.TotalPushes != 1 {
+		t.Errorf("good sink should have 1 push, got %+v", good)
+	}
+}
+
+func TestSourcePushMissingKeyIsolatedNoSilentDowngrade(t *testing.T) {
+	fx := newSourcePushFixture(t, []chrome.Cookie{
+		{HostKey: ".example.com", Name: "s", Value: "v", Path: "/"},
+	})
+	// One peer'd sink whose key is absent from the keystore, alongside a
+	// healthy peerless sink covered by the legacy shared secret. The peer'd
+	// sink must NOT be sealed under the shared secret (no silent downgrade):
+	// it fails, and only the peerless sink is POSTed.
+	urlPeer := "http://sink-peer.test/sync"
+	urlShared := "http://sink-shared.test/sync"
+	fx.cfg.Sink = config.SinkRef{}
+	fx.cfg.Sinks = []config.SinkTarget{
+		{URL: urlPeer, Peer: "no-such-peer"},
+		{URL: urlShared},
+	}
+
+	_, err := fx.push()
+	if err == nil {
+		t.Fatal("expected error for missing per-sink key, got nil")
+	}
+	if !strings.Contains(err.Error(), "no-such-peer") {
+		t.Errorf("error should name the peer with the missing key, got: %v", err)
+	}
+	posted := fx.capture.postedURLs()
+	if len(posted) != 1 || posted[0] != urlShared {
+		t.Fatalf("only the shared-secret sink should be posted (no downgrade of the peer'd sink), got %v", posted)
+	}
+}

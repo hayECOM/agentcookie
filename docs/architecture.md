@@ -50,7 +50,11 @@
 
 No Keychain, no Chrome SQLite rewrite, no libsecret. Just live CDP injection.
 Tailscale required: sink MUST bind a 100.x address (refuses to start without tailnet).
-Security: missing policy = allowlist-empty (ship nothing) on Linux.
+
+Security default (v1.0): missing policy = allowlist-empty (ship nothing) on Linux.
+For a single-operator trusted box, the featured setup writes blocklist.yaml with
+policy: blocklist and domains: [] to enable sync-all. This is an EXPLICIT operator
+choice, not the code default. The code default remains security-by-default.
 ```
 
 ## Module layout

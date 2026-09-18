@@ -1,30 +1,51 @@
 // Package chromepaths centralizes the on-disk Chrome profile paths
-// agentcookie reads and writes. macOS-only. Default profile only (v0.7
-// scope limit).
+// agentcookie reads and writes. Supports macOS and Linux.
+//
+// v0.7 scope: Default profile only. v0.8+ discovers extra profiles
+// (Profile N, Guest Profile, agent user-data-dirs) via Discover().
 package chromepaths
 
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 )
+
+// ChromeProfileRoot returns the user's Chrome user-data-dir on the current OS.
+// On macOS: ~/Library/Application Support/Google/Chrome
+// On Linux: ~/.config/google-chrome
+func ChromeProfileRoot() string {
+	home, _ := os.UserHomeDir()
+	if runtime.GOOS == "linux" {
+		return filepath.Join(home, ".config", "google-chrome")
+	}
+	return filepath.Join(home, "Library", "Application Support", "Google", "Chrome")
+}
 
 // MacChromeProfileRoot returns the user's Chrome user-data-dir on macOS:
 //
 //	~/Library/Application Support/Google/Chrome
+//
+// Deprecated: Use ChromeProfileRoot() which is OS-aware.
 func MacChromeProfileRoot() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, "Library", "Application Support", "Google", "Chrome")
 }
 
-// DefaultProfileDir returns the path to the Default profile dir, the only
-// profile v0.7 syncs.
+// DefaultProfileDir returns the path to the Default profile dir.
 func DefaultProfileDir() string {
-	return filepath.Join(MacChromeProfileRoot(), "Default")
+	return filepath.Join(ChromeProfileRoot(), "Default")
 }
 
 // CookiesDB returns the SQLite path for the Default profile's cookies.
+// Checks Network/Cookies first (Chrome 96+), then falls back to Cookies.
 func CookiesDB() string {
-	return filepath.Join(DefaultProfileDir(), "Cookies")
+	profileDir := DefaultProfileDir()
+	networkCookies := filepath.Join(profileDir, "Network", "Cookies")
+	if info, err := os.Stat(networkCookies); err == nil && !info.IsDir() {
+		return networkCookies
+	}
+	return filepath.Join(profileDir, "Cookies")
 }
 
 // LocalStorageLevelDB returns the dir holding the Default profile's

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -40,6 +41,79 @@ security:
 	}
 }
 
+func TestLoadSourceCDPSourceParsesAndRejectsUnsafeEndpoint(t *testing.T) {
+	t.Run("loopback endpoint", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "source.yaml", `
+sink:
+  url: http://example.test:9999/sync
+peer:
+  hostname: sink
+cdp_source:
+  enabled: true
+  endpoint: http://127.0.0.1:9230
+`)
+		cfg, err := LoadSource(dir)
+		if err != nil {
+			t.Fatalf("LoadSource: %v", err)
+		}
+		if !cfg.CDPSource.Enabled || cfg.CDPSource.Endpoint != "http://127.0.0.1:9230" {
+			t.Fatalf("CDPSource = %+v", cfg.CDPSource)
+		}
+	})
+
+	t.Run("non-loopback endpoint", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "source.yaml", `
+sink:
+  url: http://example.test:9999/sync
+peer:
+  hostname: sink
+cdp_source:
+  enabled: true
+  endpoint: http://100.91.16.115:9230
+`)
+		if _, err := LoadSource(dir); err == nil {
+			t.Fatal("LoadSource accepted a non-loopback cdp_source endpoint")
+		}
+	})
+
+	t.Run("rejects SQLite browser configuration", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "source.yaml", `
+sink:
+  url: http://example.test:9999/sync
+peer:
+  hostname: sink
+chrome:
+  db_path: /private/Cookies
+cdp_source:
+  enabled: true
+  endpoint: http://127.0.0.1:9230
+`)
+		if _, err := LoadSource(dir); err == nil {
+			t.Fatal("LoadSource accepted cdp_source combined with chrome.db_path")
+		}
+	})
+}
+
+func TestLoadSourceLocalAcceptsCDPSource(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "source.yaml", `
+cdp_source:
+  enabled: true
+  endpoint: http://127.0.0.1:9230
+`)
+
+	cfg, err := LoadSourceLocal(dir)
+	if err != nil {
+		t.Fatalf("LoadSourceLocal CDP source: %v", err)
+	}
+	if !cfg.CDPSource.Enabled {
+		t.Fatal("LoadSourceLocal did not retain cdp_source")
+	}
+}
+
 func TestLoadSourceBrowserBlockParsesAndDerivesPath(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "source.yaml", `
@@ -59,7 +133,44 @@ security:
 		t.Errorf("browser ref: got %+v", cfg.Browser)
 	}
 	home, _ := os.UserHomeDir()
-	want := filepath.Join(home, "Library", "Application Support", "com.openai.atlas", "browser-data", "host", "Profile 1", "Cookies")
+	// Atlas paths are the same on macOS and Linux (Atlas is macOS-only,
+	// but the path derivation code passes the macOS segments through on Linux
+	// since there's no Linux equivalent).
+	var want string
+	if runtime.GOOS == "linux" {
+		want = filepath.Join(home, ".config", "com.openai.atlas", "browser-data", "host", "Profile 1", "Cookies")
+	} else {
+		want = filepath.Join(home, "Library", "Application Support", "com.openai.atlas", "browser-data", "host", "Profile 1", "Cookies")
+	}
+	if cfg.Chrome.DBPath != want {
+		t.Errorf("derived DBPath: got %q, want %q", cfg.Chrome.DBPath, want)
+	}
+}
+
+func TestLoadSourceBrowserDiaDerivesUserDataPath(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "source.yaml", `
+sink:
+  url: http://example.test:9999/sync
+browser:
+  name: dia
+security:
+  shared_secret: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+`)
+	cfg, err := LoadSource(dir)
+	if err != nil {
+		t.Fatalf("LoadSource: %v", err)
+	}
+	if cfg.Browser.Name != "dia" {
+		t.Errorf("browser name: got %q, want dia", cfg.Browser.Name)
+	}
+	home, _ := os.UserHomeDir()
+	var want string
+	if runtime.GOOS == "linux" {
+		want = filepath.Join(home, ".config", "Dia", "User Data", "Default", "Cookies")
+	} else {
+		want = filepath.Join(home, "Library", "Application Support", "Dia", "User Data", "Default", "Cookies")
+	}
 	if cfg.Chrome.DBPath != want {
 		t.Errorf("derived DBPath: got %q, want %q", cfg.Chrome.DBPath, want)
 	}
@@ -114,7 +225,7 @@ func TestLoadSourceUnknownBrowserFailsWithSupportedNames(t *testing.T) {
 sink:
   url: http://example.test:9999/sync
 browser:
-  name: dia
+  name: vivaldi
 security:
   shared_secret: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 `)
@@ -345,6 +456,22 @@ chrome:
 `)
 		if _, err := LoadSource(dir); err == nil {
 			t.Fatal("LoadSource should still require sink.url")
+		}
+	})
+
+	t.Run("accepts CDP source for CDP-capable local commands", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "source.yaml", `
+cdp_source:
+  enabled: true
+  endpoint: http://127.0.0.1:9230
+`)
+		cfg, err := LoadSourceLocal(dir)
+		if err != nil {
+			t.Fatalf("LoadSourceLocal CDP source: %v", err)
+		}
+		if !cfg.CDPSource.Enabled {
+			t.Fatal("LoadSourceLocal did not retain CDP source configuration")
 		}
 	})
 }
@@ -724,5 +851,114 @@ func writeFile(t *testing.T, dir, name, content string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
 		t.Fatalf("write %s: %v", name, err)
+	}
+}
+
+func TestLoadSourceMultiSinkResolvesAllEntries(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "source.yaml", `
+sinks:
+  - url: http://a.test:9999/sync
+    peer: alpha
+  - url: http://b.test:9999/sync
+    peer: bravo
+chrome:
+  db_path: ~/Library/Application Support/Google/Chrome/Default/Cookies
+`)
+	cfg, err := LoadSource(dir)
+	if err != nil {
+		t.Fatalf("LoadSource: %v", err)
+	}
+	got := cfg.ResolvedSinks()
+	if len(got) != 2 {
+		t.Fatalf("expected 2 resolved sinks, got %d", len(got))
+	}
+	if got[0].URL != "http://a.test:9999/sync" || got[0].Peer != "alpha" {
+		t.Errorf("sink[0] wrong: %+v", got[0])
+	}
+	if got[1].URL != "http://b.test:9999/sync" || got[1].Peer != "bravo" {
+		t.Errorf("sink[1] wrong: %+v", got[1])
+	}
+}
+
+func TestResolvedSinksSynthesizesLegacyScalar(t *testing.T) {
+	cfg := &SourceConfig{
+		Sink: SinkRef{URL: "http://legacy.test:9999/sync"},
+		Peer: PeerRef{Hostname: "legacy-peer"},
+	}
+	got := cfg.ResolvedSinks()
+	if len(got) != 1 {
+		t.Fatalf("expected 1 synthesized sink, got %d", len(got))
+	}
+	if got[0].URL != "http://legacy.test:9999/sync" || got[0].Peer != "legacy-peer" {
+		t.Errorf("synthesized sink wrong: %+v", got[0])
+	}
+}
+
+func TestResolvedSinksPrefersSinksOverLegacyScalar(t *testing.T) {
+	cfg := &SourceConfig{
+		Sinks: []SinkTarget{{URL: "http://new.test:9999/sync", Peer: "new-peer"}},
+		Sink:  SinkRef{URL: "http://legacy.test:9999/sync"},
+		Peer:  PeerRef{Hostname: "legacy-peer"},
+	}
+	got := cfg.ResolvedSinks()
+	if len(got) != 1 || got[0].Peer != "new-peer" {
+		t.Fatalf("expected sinks list to win, got %+v", got)
+	}
+}
+
+func TestResolvedSinksEmptyWhenNeitherSet(t *testing.T) {
+	cfg := &SourceConfig{}
+	if got := cfg.ResolvedSinks(); got != nil {
+		t.Fatalf("expected nil for no sinks, got %+v", got)
+	}
+}
+
+func TestLoadSourceMultiSinkRequiresPerSinkPeerOrSharedSecret(t *testing.T) {
+	dir := t.TempDir()
+	// A sinks entry with no peer and no legacy shared secret has no way to seal.
+	writeFile(t, dir, "source.yaml", `
+sinks:
+  - url: http://a.test:9999/sync
+chrome:
+  db_path: ~/Library/Application Support/Google/Chrome/Default/Cookies
+`)
+	if _, err := LoadSource(dir); err == nil {
+		t.Fatal("expected error for a sink with no peer and no shared secret, got nil")
+	}
+}
+
+func TestLoadSourceMultiSinkSharedSecretCoversPeerlessSink(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "source.yaml", `
+sinks:
+  - url: http://a.test:9999/sync
+security:
+  shared_secret: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+chrome:
+  db_path: ~/Library/Application Support/Google/Chrome/Default/Cookies
+`)
+	if _, err := LoadSource(dir); err != nil {
+		t.Fatalf("shared secret should cover a peerless sink: %v", err)
+	}
+}
+
+func TestExampleMultiSinkConfigDecodes(t *testing.T) {
+	// The shipped multi-sink example must load through the strict loader,
+	// so the docs never drift from the accepted schema.
+	dir := t.TempDir()
+	data, err := os.ReadFile(filepath.Join("..", "..", "examples", "source-multi-sink.yaml"))
+	if err != nil {
+		t.Fatalf("read example: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "source.yaml"), data, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := LoadSource(dir)
+	if err != nil {
+		t.Fatalf("example source-multi-sink.yaml should load: %v", err)
+	}
+	if got := len(cfg.ResolvedSinks()); got != 2 {
+		t.Fatalf("example should declare 2 sinks, got %d", got)
 	}
 }

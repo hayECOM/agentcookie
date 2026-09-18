@@ -31,6 +31,50 @@ type SourceState struct {
 	LastDBSCWarned  int      `json:"last_dbsc_warned,omitempty"`
 	LastDBSCSkipped int      `json:"last_dbsc_skipped,omitempty"`
 	LastDBSCSample  []string `json:"last_dbsc_sample,omitempty"`
+
+	// Sinks holds one record per fan-out sink (multi-sink). The top-level
+	// LastPush/TotalPushes/TotalFailures/LastError fields above remain the
+	// cross-sink aggregate so pre-multi-sink readers keep working; per-sink
+	// detail lives here. Empty on a single legacy sink or an old state file
+	// written before multi-sink, in which case the top-level fields and the
+	// legacy SinkURL are the whole story.
+	Sinks []SinkPushState `json:"sinks,omitempty"`
+}
+
+// SinkPushState is one fan-out sink's push record, keyed by peer hostname
+// (the stable pairing identity). URL is stored for display and updated in
+// place when a sink's URL changes, so a URL edit does not orphan the record
+// or lose its history.
+type SinkPushState struct {
+	Peer          string    `json:"peer,omitempty"`
+	URL           string    `json:"url"`
+	LastPush      time.Time `json:"last_push,omitempty"`
+	LastPushCount int       `json:"last_push_count"`
+	TotalPushes   int       `json:"total_pushes"`
+	TotalFailures int       `json:"total_failures"`
+	LastError     string    `json:"last_error,omitempty"`
+	LastErrorAt   time.Time `json:"last_error_at,omitempty"`
+}
+
+// SinkFor returns the per-sink record for a peer (or URL when the sink has
+// no peer), creating and appending it on first use. Keying on peer keeps the
+// record stable across a URL change; the record's URL is refreshed to the
+// current value on each call so display stays accurate.
+func (s *SourceState) SinkFor(peer, url string) *SinkPushState {
+	key := peer
+	for i := range s.Sinks {
+		match := s.Sinks[i].Peer == peer
+		if key == "" {
+			// Peerless sink: fall back to URL identity.
+			match = s.Sinks[i].Peer == "" && s.Sinks[i].URL == url
+		}
+		if match {
+			s.Sinks[i].URL = url
+			return &s.Sinks[i]
+		}
+	}
+	s.Sinks = append(s.Sinks, SinkPushState{Peer: peer, URL: url})
+	return &s.Sinks[len(s.Sinks)-1]
 }
 
 // SinkState is the sink daemon's observable state, written on every accepted
@@ -53,6 +97,24 @@ type SinkState struct {
 	// no sync has yet triggered a sinkpush run. `agentcookie status`
 	// surfaces this; `agentcookie wizard verify-adapters` reads it.
 	LastAdapterResults []AdapterResult `json:"last_adapter_results,omitempty"`
+
+	// LiveCDP tracks the Linux sink's live CDP injection path (attach to
+	// an already-running Chrome via --remote-debugging-port). Populated
+	// when live_cdp.enabled is true in sink.yaml.
+	LiveCDP *LiveCDPState `json:"live_cdp,omitempty"`
+}
+
+// LiveCDPState records the outcome of live CDP injection into an
+// already-running Chrome. This is the Linux sink's primary injection path.
+type LiveCDPState struct {
+	Enabled       bool      `json:"enabled"`
+	Endpoint      string    `json:"endpoint"`
+	LastInjectAt  time.Time `json:"last_inject_at,omitempty"`
+	LastContexts  int       `json:"last_contexts,omitempty"`
+	LastCookies   int       `json:"last_cookies,omitempty"`
+	LastError     string    `json:"last_error,omitempty"`
+	TotalInjects  int       `json:"total_injects"`
+	TotalFailures int       `json:"total_failures"`
 }
 
 // AdapterResult is the per-adapter outcome of the most recent sinkpush

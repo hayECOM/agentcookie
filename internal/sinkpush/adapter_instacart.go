@@ -3,9 +3,7 @@ package sinkpush
 import (
 	"bytes"
 	"fmt"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 
 	"github.com/mvanhorn/agentcookie/internal/chrome"
@@ -31,21 +29,33 @@ type InstacartAdapter struct {
 	binary string
 }
 
-// NewInstacart returns an adapter pointing at the default install
-// location (~/go/bin/instacart-pp-cli). Honors $HOME for the user
-// resolution.
+// NewInstacart returns an adapter that finds the instacart CLI. It checks:
+//  1. ~/.local/bin/instacart-pp-cli (printing-press installer path)
+//  2. ~/go/bin/instacart-pp-cli (canonical go install location)
+//  3. ~/bin/instacart-pp-cli (user bin directory)
+//  4. `instacart-pp-cli` on PATH via exec.LookPath
+//  5. `instacart` on PATH (common alias name)
 func NewInstacart() *InstacartAdapter {
-	home, _ := os.UserHomeDir()
-	return &InstacartAdapter{binary: filepath.Join(home, "go", "bin", "instacart-pp-cli")}
+	return &InstacartAdapter{binary: findPPCLI("instacart-pp-cli", "instacart")}
 }
 
 func (a *InstacartAdapter) Name() string { return "instacart-pp-cli" }
 
-func (a *InstacartAdapter) CLIBinary() string { return a.binary }
+// resolveBinary returns the binary path to use. If the stored binary path
+// is executable (e.g., set directly in tests), use it. Otherwise, re-resolve
+// via findPPCLI to handle binaries installed after init() and to avoid using
+// a non-executable cached path that would shadow a valid executable elsewhere.
+func (a *InstacartAdapter) resolveBinary() string {
+	if a.binary != "" && isExecutableFile(a.binary) {
+		return a.binary
+	}
+	return findPPCLI("instacart-pp-cli", "instacart")
+}
+
+func (a *InstacartAdapter) CLIBinary() string { return a.resolveBinary() }
 
 func (a *InstacartAdapter) IsInstalled() bool {
-	info, err := os.Stat(a.binary)
-	return err == nil && !info.IsDir()
+	return isExecutableFile(a.resolveBinary())
 }
 
 func (a *InstacartAdapter) CookieHostPatterns() []string {
@@ -68,7 +78,8 @@ func (a *InstacartAdapter) Push(cookies []chrome.Cookie) error {
 		return nil
 	}
 
-	cmd := exec.Command(a.binary, "auth", "paste")
+	binary := a.resolveBinary()
+	cmd := exec.Command(binary, "auth", "paste")
 	cmd.Stdin = strings.NewReader(header)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

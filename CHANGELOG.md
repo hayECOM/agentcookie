@@ -2,6 +2,76 @@
 
 ## [Unreleased]
 
+### Dia source-browser support
+
+Dia (The Browser Company) is a Chromium-family source adapter using the same Safe Storage model as Arc, Brave, and Edge. Set `browser.name: dia` in `source.yaml`. Discovery labels Dia's `User Data` root as `dia` so key lookup uses `Dia Safe Storage` rather than Chrome's.
+
+### Multi-sink fan-out
+
+One source can now push the same cookies and secrets to several sinks.
+
+- `source.yaml` accepts a `sinks:` list, each entry with its own `url` and `peer`. A legacy single-sink config (`sink:` + `peer:`) keeps working unchanged and loads as a one-element list.
+- A push reads and filters cookies once, then seals and POSTs to each sink with its own paired key. A missing per-sink key isolates that sink instead of aborting the whole push, and never silently downgrades a paired sink to the legacy shared secret.
+- Per-sink failures are isolated; a partial or total sink failure is a non-zero `--once` exit. The `--once` deadline scales with sink count so a slow first sink cannot starve later healthy ones.
+- `agentcookie wizard install --as source --add-sink --peer <host> --sink-url <url>` pairs and appends an additional sink to an existing config.
+- `agentcookie status` and `agentcookie doctor` report per-sink push state.
+- Example: `examples/source-multi-sink.yaml`.
+
+### PP CLI config carriage (#118)
+
+Auto-discovered Printing Press CLIs were pointed at the env-shaped `[secrets.file]` slot, so their `config.toml` went through a strict `KEY=VALUE` parser that cannot read the TOML they actually write. Every one of them failed to sync, and CLIs that were simply never authenticated were reported as errors on every push.
+
+- A PP CLI's `config.toml` now rides as a `[[files]]` carriage item. Bytes are carried verbatim, so nested tables and comments survive and nothing is parsed.
+- Carriage is gated on the manifest declaring at least one sensitive key, so a preference-only config is not swept in.
+- A never-authenticated CLI is skipped quietly instead of erroring; a hand-written manifest naming a missing file still errors, because its author chose the path.
+- `agentcookie secret link-configs` bridges carried configs into `~/.config/<cli>/config.toml`, where the installed fleet actually reads them (only binaries built after roughly 2026-07 honor an env pointer). Read-only planning, dry run until `--apply`. It never replaces an existing config, and the link is confined to `~/.config` so no symlink along the destination path can redirect it out of that tree.
+- Measured across 59 installed CLIs: `secrets-bus` error lines 40 to 0, CLIs contributing secrets 2 to 9.
+
+## [1.0.0] - 2026-08-13
+
+### Featured: Mac to Linux continuous sync
+
+The 1.0 release ships Mac to Linux cookie sync as the featured path. Your Mac's Chrome sessions flow to a Linux agent runtime (Grok Bot, cloud VM, homelab server) via live CDP injection over Tailscale.
+
+**What's new:**
+
+- Linux binaries: `agentcookie_1.0.0_linux_amd64.tar.gz` and `agentcookie_1.0.0_linux_arm64.tar.gz`
+- Live CDP injection on Linux: cookies go into Chrome's in-memory store via `Storage.setCookies`
+- No Chrome SQLite write on Linux (expected; success is the live CDP inject line)
+- Tailscale-only transport with AES-256-GCM sealed envelopes
+
+### Extra Chrome profile discovery (#115, #116)
+
+- Mac extra Chrome profiles (Profile 1, Profile 2, etc.) are auto-discovered and decrypted
+- Extra-profile cookies flow to the sidecar, adapters, and live CDP alongside Default profile cookies
+- Sink adapters union extra-profile cookies through the same blocklist policy
+- `agentcookie doctor` and `agentcookie status` report discovered profile stores
+- Linux: discovery and doctor/status name stores, but Chrome SQLite is not decrypted (no libsecret); sidecar/plaintext and live CDP remain the Linux path
+
+**Install:**
+
+Download from [GitHub Releases](https://github.com/mvanhorn/agentcookie/releases/tag/v1.0.0). Verify against `checksums.txt`. See the README for the full how-to.
+
+**Security defaults:**
+
+- Linux sinks with missing `blocklist.yaml` or omitted `policy:` ship nothing (allowlist-empty). This is security-by-default.
+- For a single-operator trusted box, write `blocklist.yaml` with `policy: blocklist` and `domains: []` to enable sync-all.
+- The 1.0 release does NOT change this default in code. A later release may flip the default, which would be a breaking change.
+
+**Honest limits:**
+
+- Linux `wrote 0 cookies` is expected (success is live CDP inject)
+- Google/DBSC cookies need local sign-in on the sink; copied cookies expire in minutes
+- CDP port is loopback-only; same-user processes can attach to the debug port
+- Cookie values never appear in logs
+
+**Breaking changes from beta:**
+
+- Archive naming changed to underscores: `agentcookie_1.0.0_darwin_arm64.tar.gz` (was `agentcookie-VERSION-darwin-arm64.tar.gz`)
+- `install-beta.sh` pattern updated to match new archive names
+
+## [Unreleased]
+
 ### Cookie allowlist policy
 
 `blocklist.yaml` now accepts an explicit `policy` field. Omitted policy and

@@ -324,6 +324,39 @@ func TestCheckSourceState(t *testing.T) {
 			t.Fatalf("got %q", c.Severity)
 		}
 	})
+	t.Run("per-sink failure names the failing sink", func(t *testing.T) {
+		st := &state.SourceState{
+			LastPush:      time.Now(),
+			TotalFailures: 1,
+			Sinks: []state.SinkPushState{
+				{Peer: "alpha", URL: "http://a.test/sync", TotalPushes: 4},
+				{Peer: "bravo", URL: "http://b.test/sync", TotalFailures: 1, LastError: "connection refused"},
+			},
+		}
+		c := checkSourceStateFrom(st, nil)
+		if c.Severity != SeverityWarn {
+			t.Fatalf("got %q", c.Severity)
+		}
+		if !strings.Contains(c.Detail, "bravo") {
+			t.Errorf("detail should name the failing sink, got %q", c.Detail)
+		}
+	})
+	t.Run("healthy multi-sink notes sink count", func(t *testing.T) {
+		st := &state.SourceState{
+			LastPush: time.Now(),
+			Sinks: []state.SinkPushState{
+				{Peer: "alpha", URL: "http://a.test/sync", TotalPushes: 4},
+				{Peer: "bravo", URL: "http://b.test/sync", TotalPushes: 4},
+			},
+		}
+		c := checkSourceStateFrom(st, nil)
+		if c.Severity != SeverityOK {
+			t.Fatalf("got %q (%q)", c.Severity, c.Detail)
+		}
+		if !strings.Contains(c.Detail, "2 sinks") {
+			t.Errorf("detail should note the sink count, got %q", c.Detail)
+		}
+	})
 }
 
 func TestCheckDBSC(t *testing.T) {
@@ -672,7 +705,7 @@ func TestCheckSourceAdapter(t *testing.T) {
 	t.Run("unknown browser lists supported names", func(t *testing.T) {
 		cfg := &config.SourceConfig{
 			Chrome:  config.ChromeRef{DBPath: "/tmp/Cookies"},
-			Browser: config.BrowserRef{Name: "dia"},
+			Browser: config.BrowserRef{Name: "vivaldi"},
 		}
 		c := checkSourceAdapter(cfg, exists, password, decryptOK)
 		if c.Severity != SeverityFail {
@@ -752,9 +785,10 @@ peer:
 	// adapters added the Source adapter check. The cmux delivery surface added
 	// the cmux delivery check. Browser-bound-session honesty added the cmux
 	// session health check (source role only; present here since this fixture
-	// is source).
-	if got := len(report.Checks); got != 20 {
-		t.Fatalf("got %d checks, want 20", got)
+	// is source). Linux sink polish added Live CDP endpoint + Daemon binary
+	// path checks. Chrome extra profile discovery added the Chrome stores check.
+	if got := len(report.Checks); got != 23 {
+		t.Fatalf("got %d checks, want 23", got)
 	}
 
 	// Serialize the envelope and confirm it round-trips.
@@ -948,4 +982,101 @@ func TestCheckCmuxLocalLoop_ConfigEnabledButAgentDown(t *testing.T) {
 	if !strings.Contains(c.Remediation, "enable") {
 		t.Errorf("remediation should point at enable: %q", c.Remediation)
 	}
+}
+
+// TestCheckLiveCDPEndpoint covers the Linux sink's live CDP endpoint check.
+func TestCheckLiveCDPEndpoint(t *testing.T) {
+	okProbe := func(string) error { return nil }
+	errProbe := func(string) error { return errors.New("connection refused") }
+
+	t.Run("disabled is skipped", func(t *testing.T) {
+		cfg := &config.SinkConfig{LiveCDP: config.LiveCDPRef{Enabled: false}}
+		c := checkLiveCDPEndpointWith(cfg, okProbe)
+		if c.Severity != SeveritySkipped {
+			t.Fatalf("got %q, want SKIPPED", c.Severity)
+		}
+	})
+
+	t.Run("enabled and reachable is OK", func(t *testing.T) {
+		cfg := &config.SinkConfig{LiveCDP: config.LiveCDPRef{Enabled: true, Endpoint: "http://127.0.0.1:9223"}}
+		c := checkLiveCDPEndpointWith(cfg, okProbe)
+		if c.Severity != SeverityOK {
+			t.Fatalf("got %q (%q), want OK", c.Severity, c.Detail)
+		}
+		if !strings.Contains(c.Detail, "9223") {
+			t.Errorf("detail should mention the endpoint: %q", c.Detail)
+		}
+	})
+
+	t.Run("unreachable with no alternatives is FAIL", func(t *testing.T) {
+		cfg := &config.SinkConfig{LiveCDP: config.LiveCDPRef{Enabled: true, Endpoint: "http://127.0.0.1:9999"}}
+		c := checkLiveCDPEndpointWith(cfg, errProbe)
+		if c.Severity != SeverityFail {
+			t.Fatalf("got %q (%q), want FAIL", c.Severity, c.Detail)
+		}
+		if !strings.Contains(c.Remediation, "--remote-debugging-port") {
+			t.Errorf("remediation should mention --remote-debugging-port: %q", c.Remediation)
+		}
+	})
+
+	t.Run("unreachable but alternative found is WARN", func(t *testing.T) {
+		calls := make(map[string]bool)
+		probe := func(ep string) error {
+			calls[ep] = true
+			if ep == "http://127.0.0.1:9228" {
+				return nil
+			}
+			return errors.New("connection refused")
+		}
+		cfg := &config.SinkConfig{LiveCDP: config.LiveCDPRef{Enabled: true, Endpoint: "http://127.0.0.1:9999"}}
+		c := checkLiveCDPEndpointWith(cfg, probe)
+		if c.Severity != SeverityWarn {
+			t.Fatalf("got %q (%q), want WARN", c.Severity, c.Detail)
+		}
+		if !strings.Contains(c.Detail, "found Chrome at") {
+			t.Errorf("detail should mention found Chrome: %q", c.Detail)
+		}
+		if !strings.Contains(c.Remediation, "9228") {
+			t.Errorf("remediation should suggest the reachable port: %q", c.Remediation)
+		}
+	})
+
+	t.Run("default endpoint used when empty", func(t *testing.T) {
+		var probed string
+		probe := func(ep string) error {
+			probed = ep
+			return nil
+		}
+		cfg := &config.SinkConfig{LiveCDP: config.LiveCDPRef{Enabled: true}}
+		c := checkLiveCDPEndpointWith(cfg, probe)
+		if c.Severity != SeverityOK {
+			t.Fatalf("got %q, want OK", c.Severity)
+		}
+		if probed != "http://127.0.0.1:9223" {
+			t.Errorf("expected default endpoint 9223, got %q", probed)
+		}
+	})
+}
+
+// TestCheckDaemonBinaryPath covers the daemon binary path mismatch check.
+func TestCheckDaemonBinaryPath(t *testing.T) {
+	t.Run("no configs is OK", func(t *testing.T) {
+		c := checkDaemonBinaryPath(nil, nil)
+		if c.Severity != SeverityOK {
+			t.Fatalf("got %q, want OK", c.Severity)
+		}
+	})
+
+	t.Run("no plist files is OK (Linux or fresh install)", func(t *testing.T) {
+		t.Setenv("HOME", t.TempDir())
+		srcCfg := &config.SourceConfig{}
+		sinkCfg := &config.SinkConfig{}
+		c := checkDaemonBinaryPath(srcCfg, sinkCfg)
+		// On Linux, this will be OK because we skip LaunchAgent checks.
+		// On macOS without plist files, it's also OK because extractLaunchAgentBinaryPath
+		// returns empty string when the file doesn't exist.
+		if c.Severity != SeverityOK {
+			t.Fatalf("got %q, want OK (no plist files)", c.Severity)
+		}
+	})
 }

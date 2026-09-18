@@ -9,39 +9,56 @@ permissions:
   contents: write
 
 jobs:
-  goreleaser:
-    runs-on: macos-latest
-    # Skip the entire job when the signing secrets aren't configured.
-    # Releases are cut locally by the maintainer until CERTIFICATE_OSX_APPLICATION
-    # and AC_NOTARY_PASSWORD are populated; without this guard `make release`
-    # would fail on every tag and pollute the CI history.
+  # Build Linux binaries on Ubuntu using .goreleaser.linux.yaml
+  build-linux:
+    runs-on: ubuntu-latest
     if: ${{ vars.RELEASE_CI_ENABLED == 'true' }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version-file: go.mod
           cache: true
 
-      # Import the Developer ID Application certificate into a temporary
-      # keychain so codesign can find it. The .p12 bundle and its password
-      # are repo secrets. The action creates an ephemeral keychain, unlocks
-      # it, and adds it to the search list for the rest of the job.
-      #
-      # To enable CI-driven releases, the maintainer must add the following
-      # GitHub Actions secrets and set the `RELEASE_CI_ENABLED` repo variable
-      # to `true` (the job-level `if:` above gates on the variable):
-      #   - CERTIFICATE_OSX_APPLICATION : base64-encoded .p12 of the
-      #     Developer ID Application cert + private key
-      #   - CERTIFICATE_OSX_APPLICATION_PASSWORD : password for the .p12
-      #   - AC_NOTARY_PASSWORD : app-specific password for Apple notarytool
-      # The matching cert is Common Name
-      #   "Developer ID Application: Matthew Charles Van Horn (NM8VT393AR)"
-      # See docs/runbook-v0.12-codesign.md for the export / renewal flow.
-      # Until the variable is flipped, releases are cut locally with
-      # `make release` + scripts/release-tarball.sh + `gh release create`.
+      # Install cross-compiler for arm64
+      - name: install arm64 cross-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      # Use goreleaser with the linux-specific config
+      - name: goreleaser linux
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean --config .goreleaser.linux.yaml --skip=publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: upload linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-binaries
+          path: dist/*.tar.gz
+
+  # Build darwin binaries on macOS (codesigning requires macOS)
+  build-darwin:
+    runs-on: macos-latest
+    if: ${{ vars.RELEASE_CI_ENABLED == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
       - name: import Developer ID cert
         if: ${{ secrets.CERTIFICATE_OSX_APPLICATION != '' }}
         uses: apple-actions/import-codesign-certs@v3
@@ -49,20 +66,9 @@ jobs:
           p12-file-base64: ${{ secrets.CERTIFICATE_OSX_APPLICATION }}
           p12-password: ${{ secrets.CERTIFICATE_OSX_APPLICATION_PASSWORD }}
 
-      # Sanity: print which codesigning identities are visible to this
-      # runner. On a properly configured release this lists the Developer
-      # ID Application identity NM8VT393AR. If the secret is unset, the
-      # list will be empty and goreleaser's signing post-hook will fail
-      # fast with the runbook pointer.
       - name: list codesigning identities
         run: security find-identity -v -p codesigning
 
-      # Store the notarytool credentials in the runner's login keychain.
-      # The maintainer generates an app-specific password at
-      # appleid.apple.com and saves it as the AC_NOTARY_PASSWORD secret.
-      # See docs/runbook-v0.12-codesign.md "Notarization" for the
-      # one-time setup steps. Without this step, scripts/notarize.sh
-      # below would fail with a "credentials not found" error.
       - name: setup notarytool credentials
         if: ${{ secrets.AC_NOTARY_PASSWORD != '' }}
         run: |
@@ -71,38 +77,57 @@ jobs:
             --team-id NM8VT393AR \
             --password "${{ secrets.AC_NOTARY_PASSWORD }}"
 
-      # Build, sign, notarize the agentcookie binary. After this step
-      # bin/agentcookie is fully launchable on any Mac without
-      # Gatekeeper interactive approval.
       - name: make release
         run: make release
 
-      # Bundle the notarized binary + install-beta.sh + quickstart into
-      # a single tarball friends can extract and run.
       - name: build release tarball
         run: scripts/release-tarball.sh "${{ github.ref_name }}"
 
-      # GoReleaser also runs to publish the standard cross-platform
-      # archives and the GitHub release entry with notes. It uses the
-      # signed bin/agentcookie produced above.
-      - name: goreleaser
-        uses: goreleaser/goreleaser-action@v6
+      - name: upload darwin artifacts
+        uses: actions/upload-artifact@v4
         with:
-          distribution: goreleaser
-          version: "~> v2"
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          AGENTCOOKIE_SIGN_IDENTITY: "Developer ID Application: Matthew Charles Van Horn (NM8VT393AR)"
+          name: darwin-binaries
+          path: dist/*.tar.gz
 
-      # Attach the closed-beta bundle tarball to the GitHub release
-      # that goreleaser just created. The bundle is the install-script-
-      # consumable shape; goreleaser's own archives are the
-      # cross-platform binary archives.
-      - name: attach beta bundle to release
+  # Publish release after both builds complete
+  publish:
+    runs-on: ubuntu-latest
+    needs: [build-linux, build-darwin]
+    if: ${{ vars.RELEASE_CI_ENABLED == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: download linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-binaries
+          path: dist/
+
+      - name: download darwin artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: darwin-binaries
+          path: dist/
+
+      - name: list artifacts
+        run: ls -la dist/
+
+      # Generate checksums for all archives
+      - name: generate checksums
         run: |
-          gh release upload "${{ github.ref_name }}" \
-            dist/agentcookie-*-darwin-arm64.tar.gz \
-            --clobber
+          cd dist
+          sha256sum *.tar.gz > checksums.txt
+          cat checksums.txt
+
+      # Create the GitHub release with all assets
+      - name: create release
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            dist/*.tar.gz \
+            dist/checksums.txt \
+            --title "agentcookie ${{ github.ref_name }}" \
+            --generate-notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

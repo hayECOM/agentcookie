@@ -5,8 +5,8 @@
 // contracts the design + README traceability guarantees ship:
 //
 //   - Hero headline + tagline strings are present.
-//   - Terminal demo includes all three ssh second-mac commands.
-//   - Every feature in lib/features.ts renders.
+//   - Terminal demo includes all three ssh sink commands.
+//   - Every feature in lib/content/features.ts renders.
 //   - Footer links to repo, quickstart, specs, threat model.
 //
 // When the README is rewritten such that the tagline or feature
@@ -15,11 +15,13 @@
 
 // @vitest-environment jsdom
 
+import { OG_IMAGE } from "@/lib/og";
 import React from "react";
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { render, cleanup } from "@testing-library/react";
-import MarketingHome from "./page";
-import { FEATURES } from "@/lib/features";
+import MarketingHome, { metadata } from "./page";
+import { FEATURES } from "@/lib/content/features";
+import { GRAPH } from "@/lib/jsonld";
 
 vi.mock("server-only", () => ({}));
 
@@ -64,7 +66,7 @@ describe("marketing homepage (/)", () => {
     );
   });
 
-  it("renders every feature card from lib/features.ts", () => {
+  it("renders every feature card from lib/content/features.ts", () => {
     renderHome();
     for (const feature of FEATURES) {
       expect(document.body.textContent).toContain(feature.title);
@@ -100,6 +102,24 @@ describe("marketing homepage (/)", () => {
     expect(links).toContain(
       "https://github.com/mvanhorn/agentcookie/blob/main/docs/threat-model.md"
     );
+  });
+
+  it("declares a self-referencing canonical and Open Graph url", () => {
+    expect(metadata.alternates?.canonical).toBe("/");
+    expect(metadata.openGraph?.url).toBe("/");
+    expect(metadata.openGraph?.images).toEqual([OG_IMAGE]);
+    expect(metadata.twitter?.images).toEqual([OG_IMAGE]);
+  });
+
+  it("embeds the JSON-LD identity graph in a native script tag", () => {
+    renderHome();
+    const scripts = document.querySelectorAll(
+      'script[type="application/ld+json"]'
+    );
+    expect(scripts).toHaveLength(1);
+    const text = scripts[0].textContent ?? "";
+    expect(text).not.toContain("<");
+    expect(JSON.parse(text)).toEqual(GRAPH);
   });
 
   it("is agent-readable: hero tagline appears in static HTML", () => {

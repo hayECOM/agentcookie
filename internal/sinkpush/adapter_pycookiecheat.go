@@ -48,7 +48,7 @@ func newPycookiecheatStyleAdapter(name, hostPattern, configBasename, baseURL str
 	home, _ := os.UserHomeDir()
 	return &PycookiecheatStyleAdapter{
 		name:        name,
-		binary:      filepath.Join(home, "go", "bin", name),
+		binary:      findPPCLI(name),
 		hostPattern: hostPattern,
 		configDir:   filepath.Join(home, ".config", configBasename),
 		baseURL:     baseURL,
@@ -57,11 +57,21 @@ func newPycookiecheatStyleAdapter(name, hostPattern, configBasename, baseURL str
 
 func (a *PycookiecheatStyleAdapter) Name() string { return a.name }
 
-func (a *PycookiecheatStyleAdapter) CLIBinary() string { return a.binary }
+// resolveBinary returns the binary path to use. If the stored binary path
+// is executable (e.g., set directly in tests), use it. Otherwise, re-resolve
+// via findPPCLI to handle binaries installed after init() and to avoid using
+// a non-executable cached path that would shadow a valid executable elsewhere.
+func (a *PycookiecheatStyleAdapter) resolveBinary() string {
+	if a.binary != "" && isExecutableFile(a.binary) {
+		return a.binary
+	}
+	return findPPCLI(a.name)
+}
+
+func (a *PycookiecheatStyleAdapter) CLIBinary() string { return a.resolveBinary() }
 
 func (a *PycookiecheatStyleAdapter) IsInstalled() bool {
-	info, err := os.Stat(a.binary)
-	return err == nil && !info.IsDir()
+	return isExecutableFile(a.resolveBinary())
 }
 
 func (a *PycookiecheatStyleAdapter) CookieHostPatterns() []string {
