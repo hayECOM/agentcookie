@@ -40,6 +40,10 @@ func InjectCookies(ctx context.Context, profileDir string, cookies []chrome.Cook
 	if _, err := os.Stat(expanded); err != nil {
 		return fmt.Errorf("cdp.InjectCookies: profile dir %q does not exist: %w (run `agentcookie wizard install --as sink` to create it)", profileDir, err)
 	}
+	// An already-expired cookie set via Network.setCookies is a delete:
+	// it would wipe the live row the reader minted for itself. Skip them
+	// before both the twin convergence and the write (chrome.IsExpiredAt).
+	cookies, _ = chrome.DropExpired(cookies, time.Now())
 	if len(cookies) == 0 {
 		return nil
 	}

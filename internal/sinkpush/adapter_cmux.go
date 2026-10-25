@@ -136,9 +136,12 @@ func (a *CmuxAdapter) Push(cookies []chrome.Cookie) error {
 	// Drop RFC-invalid cookies up front (the same gate RunAll applies before
 	// an adapter's Push). cmux-sync calls Push directly, bypassing RunAll, so
 	// without this a malformed cookie would fail a whole batch.
+	// Expired cookies are skipped for the same reason: WebKit treats a
+	// cookie set with a past expiry as a delete (chrome.IsExpiredAt).
+	now := time.Now()
 	valid := make([]chrome.Cookie, 0, len(cookies))
 	for _, c := range cookies {
-		if Validate(c) == nil {
+		if Validate(c) == nil && !chrome.IsExpiredAt(c, now) {
 			valid = append(valid, c)
 		}
 	}

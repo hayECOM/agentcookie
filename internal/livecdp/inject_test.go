@@ -72,7 +72,7 @@ func TestBuildCookieParams_DomainCookie(t *testing.T) {
 // exact class Playwright's addCookies rejected (httpOnly + persistent) --
 // the real session cookies.
 func TestBuildCookieParams_HTTPOnlyPersistent(t *testing.T) {
-	c := chrome.Cookie{HostKey: "github.com", Name: "user_session", Value: "v", Path: "/", IsSecure: 1, IsHTTPOnly: 1, ExpiresUTC: 13363527432123456}
+	c := chrome.Cookie{HostKey: "github.com", Name: "user_session", Value: "v", Path: "/", IsSecure: 1, IsHTTPOnly: 1, ExpiresUTC: 13600000000000000} // 2031: must stay in the future
 	p := BuildCookieParams([]chrome.Cookie{c})[0]
 	if !p.HTTPOnly {
 		t.Errorf("HTTPOnly must be preserved")
@@ -190,5 +190,26 @@ func TestInject_LiveLogin(t *testing.T) {
 	defer mu.Unlock()
 	if sawCookie != "logged-in" {
 		t.Fatalf("server did not receive injected cookie; got %q (host=%s)", sawCookie, strings.TrimSpace(u.Hostname()))
+	}
+}
+
+// TestBuildCookieParams_SkipsExpiredKeepsSession: a cookie whose expiry has
+// passed must never reach Network.setCookies -- Chrome treats it as a
+// delete and wipes the live cookie the browser minted for itself (Apple's
+// shld_bt_* shield cookies, 2026-10-25). Session cookies still go through.
+func TestBuildCookieParams_SkipsExpiredKeepsSession(t *testing.T) {
+	const chromeEpochOffsetMicros = 11644473600 * 1_000_000
+	at := func(d time.Duration) int64 { return time.Now().Add(d).UnixMicro() + chromeEpochOffsetMicros }
+	got := BuildCookieParams([]chrome.Cookie{
+		{HostKey: ".apple.com", Name: "shld_bt_ck", Value: "stale", Path: "/", IsSecure: 1, ExpiresUTC: at(-time.Hour)},
+		{HostKey: ".apple.com", Name: "dssid2", Value: "sess", Path: "/", IsSecure: 1},
+		{HostKey: ".apple.com", Name: "as_atb", Value: "live", Path: "/", IsSecure: 1, ExpiresUTC: at(time.Hour)},
+	})
+	names := make([]string, 0, len(got))
+	for _, p := range got {
+		names = append(names, p.Name)
+	}
+	if strings.Join(names, ",") != "dssid2,as_atb" {
+		t.Errorf("params = %v, want [dssid2 as_atb] (expired shld_bt_ck must be skipped)", names)
 	}
 }

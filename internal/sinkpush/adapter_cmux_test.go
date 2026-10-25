@@ -654,3 +654,27 @@ func TestCmuxPush_PermissionDeniedHardFails(t *testing.T) {
 		t.Fatalf("permission denied must hard-fail, got %v", err)
 	}
 }
+
+// TestCmuxPush_SkipsExpiredCookies: cmux-sync calls Push directly, bypassing
+// RunAll, so Push itself must drop expired cookies -- WebKit treats a cookie
+// set with a past expiry as a delete of the live one.
+func TestCmuxPush_SkipsExpiredCookies(t *testing.T) {
+	f := &fakeCmux{}
+	a := newTestCmux(f, nil)
+	past := time.Now().Add(-time.Hour).UnixMicro() + chromeEpochOffsetSec*1_000_000
+	if err := a.Push([]chrome.Cookie{
+		{HostKey: ".x.com", Name: "expired", Value: "old", ExpiresUTC: past},
+		{HostKey: ".x.com", Name: "session", Value: "ok"},
+	}); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	var sent []string
+	for _, call := range f.calls {
+		if len(call) == 3 && call[1] == "browser.cookies.set" {
+			sent = append(sent, call[2])
+		}
+	}
+	if len(sent) != 1 || strings.Contains(sent[0], `"expired"`) || !strings.Contains(sent[0], `"session"`) {
+		t.Errorf("browser.cookies.set payloads = %v, want one batch with only the session cookie", sent)
+	}
+}

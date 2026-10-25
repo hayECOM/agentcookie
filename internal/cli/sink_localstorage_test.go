@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/mvanhorn/agentcookie/internal/cdp"
 	"github.com/mvanhorn/agentcookie/internal/chrome"
@@ -218,5 +219,45 @@ func TestSinkLocalStorage_FailureDoesNotBreakTheCookiePath(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("a localStorage failure failed the whole sync: %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+// TestSinkSync_NeverPushesExpiredCookies is the guard for the 2026-10-25
+// Apple Add to Bag 541: the laptop's expired shield cookies rode every
+// /sync into the browser, and a cookie set with a past expiry is a delete.
+// The push surfaces must get only unexpired cookies (session cookies
+// included); the sidecar mirror is not a push and is not asserted here.
+//
+// Guard-revert: hand cdpInject `cookies` instead of `pushable` in the
+// /sync handler and this goes red.
+func TestSinkSync_NeverPushesExpiredCookies(t *testing.T) {
+	var injected []chrome.Cookie
+	restore := SetCDPInjectorForTesting(func(_ context.Context, _ string, c []chrome.Cookie) error {
+		injected = append(injected, c...)
+		return nil
+	})
+	defer restore()
+
+	f := newLSFixture(t, &config.SinkConfig{
+		SkipChromeSQLite: true,
+		CDP:              config.CDPRef{Enabled: true, ProfileDir: t.TempDir()},
+	})
+	const chromeEpochOffsetMicros = 11644473600 * 1_000_000
+	past := time.Now().Add(-36*time.Hour).UnixMicro() + chromeEpochOffsetMicros
+	future := time.Now().Add(24*time.Hour).UnixMicro() + chromeEpochOffsetMicros
+	rec := f.post(t, 1, []chrome.Cookie{
+		{HostKey: ".example.com", Name: "shield", Value: "stale", Path: "/", ExpiresUTC: past},
+		{HostKey: ".example.com", Name: "session", Value: "s", Path: "/"},
+		{HostKey: ".example.com", Name: "live", Value: "l", Path: "/", ExpiresUTC: future},
+	}, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/sync = %d, body %q", rec.Code, rec.Body.String())
+	}
+	var names []string
+	for _, c := range injected {
+		names = append(names, c.Name)
+	}
+	if len(names) != 2 || names[0] != "session" || names[1] != "live" {
+		t.Errorf("CDP injector got %v, want [session live] (expired cookie must be skipped)", names)
 	}
 }

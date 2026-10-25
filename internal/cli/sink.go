@@ -400,18 +400,31 @@ func newSinkMux(
 		// Keychain item on this path. Failures are logged but do not
 		// fail the /sync response -- the sidecar write already
 		// succeeded above, so PP CLIs are still served.
+		// Every push below (cold CDP profile, live CDP, adapters) gets the
+		// unexpired set only. The sidecar above keeps the source's rows
+		// verbatim -- it is a mirror, not a push. Setting an already-expired
+		// cookie is a delete in Chrome and WebKit, so re-pushing the
+		// laptop's stale rows every sync wiped the cookies the destination
+		// browser minted for itself (chrome.IsExpiredAt). The push builders
+		// skip them too; filtering here is what gives the log its count.
+		pushable, expiredSkipped := chrome.DropExpired(cookies, time.Now())
+		expiredNote := ""
+		if expiredSkipped > 0 {
+			expiredNote = fmt.Sprintf(" (skipped %d expired)", expiredSkipped)
+		}
+
 		var cdpWriteMode string
 		var localStorageNote string
 		cdpProfileDir := cfg.CDP.ProfileDir
 		if cdpProfileDir == "" {
 			cdpProfileDir = "~/.agentcookie/chrome-profile"
 		}
-		if cfg.CDP.Enabled && len(cookies) > 0 {
+		if cfg.CDP.Enabled && len(pushable) > 0 {
 			profileDir := cdpProfileDir
-			if cdpErr := cdpInject(r.Context(), profileDir, cookies); cdpErr != nil {
+			if cdpErr := cdpInject(r.Context(), profileDir, pushable); cdpErr != nil {
 				fmt.Fprintf(os.Stderr, "agentcookie sink: CDP injection failed (sidecar write succeeded, PP CLIs unaffected): %v\n", cdpErr)
 			} else {
-				fmt.Fprintf(os.Stderr, "agentcookie sink: CDP injection pushed %d cookies into %s\n", len(cookies), profileDir)
+				fmt.Fprintf(os.Stderr, "agentcookie sink: CDP injection pushed %d cookies%s into %s\n", len(pushable), expiredNote, profileDir)
 				cdpWriteMode = "+cdp"
 			}
 		}
@@ -447,16 +460,16 @@ func newSinkMux(
 		var liveCDPContexts int
 		var liveCDPErr error
 		var liveCDPEndpoint string
-		if cfg.LiveCDP.Enabled && len(cookies) > 0 {
+		if cfg.LiveCDP.Enabled && len(pushable) > 0 {
 			liveCDPEndpoint = cfg.LiveCDP.Endpoint
 			if liveCDPEndpoint == "" {
 				liveCDPEndpoint = livecdp.DefaultCDPEndpoint
 			}
-			liveCDPContexts, liveCDPErr = livecdp.AttachAndInject(r.Context(), liveCDPEndpoint, cookies)
+			liveCDPContexts, liveCDPErr = livecdp.AttachAndInject(r.Context(), liveCDPEndpoint, pushable)
 			if liveCDPErr != nil {
 				fmt.Fprintf(os.Stderr, "agentcookie sink: live CDP injection failed (sidecar write succeeded): %v\n", liveCDPErr)
 			} else {
-				fmt.Fprintf(os.Stderr, "agentcookie sink: live CDP injection pushed %d cookies into %d context(s) at %s\n", len(cookies), liveCDPContexts, liveCDPEndpoint)
+				fmt.Fprintf(os.Stderr, "agentcookie sink: live CDP injection pushed %d cookies%s into %d context(s) at %s\n", len(pushable), expiredNote, liveCDPContexts, liveCDPEndpoint)
 			}
 		}
 
@@ -492,10 +505,10 @@ func newSinkMux(
 		// would silently merge personal-browser cookies into the synced
 		// set with no off switch. Gate on the mode rather than adding a
 		// knob -- a normal (universal-delivery) sink is unaffected.
-		unionedCookies := cookies
+		unionedCookies := pushable
 		if !cfg.SkipChromeSQLite {
-			unionedCookies = unionExtraProfiles(cookies, profileDir, blockMatcher)
-			if extra := len(unionedCookies) - len(cookies); extra > 0 {
+			unionedCookies = unionExtraProfiles(pushable, profileDir, blockMatcher)
+			if extra := len(unionedCookies) - len(pushable); extra > 0 {
 				fmt.Fprintf(os.Stderr, "agentcookie sink: merged %d cookie(s) from this machine's other Chrome profiles into the adapter set\n", extra)
 			}
 		}
@@ -532,7 +545,7 @@ func newSinkMux(
 		sinkState.LastWriteMode = writeMode + cdpWriteMode
 		sinkState.TotalWrites++
 		sinkState.TotalDropped += dropped
-		if cfg.LiveCDP.Enabled && len(cookies) > 0 {
+		if cfg.LiveCDP.Enabled && len(pushable) > 0 {
 			sinkState.LastWriteMode = writeMode + "+livecdp"
 			if sinkState.LiveCDP == nil {
 				sinkState.LiveCDP = &state.LiveCDPState{
@@ -541,7 +554,7 @@ func newSinkMux(
 				}
 			}
 			sinkState.LiveCDP.LastInjectAt = time.Now().UTC()
-			sinkState.LiveCDP.LastCookies = len(cookies)
+			sinkState.LiveCDP.LastCookies = len(pushable)
 			sinkState.LiveCDP.LastContexts = liveCDPContexts
 			if liveCDPErr != nil {
 				sinkState.LiveCDP.LastError = liveCDPErr.Error()
@@ -583,8 +596,8 @@ func newSinkMux(
 			if liveCDPErr != nil {
 				okLine += fmt.Sprintf("; live_cdp: FAILED at %s: %v", endpoint, liveCDPErr)
 			} else if liveCDPContexts > 0 {
-				okLine += fmt.Sprintf("; live_cdp: injected %d cookies into %d context(s) at %s", len(cookies), liveCDPContexts, endpoint)
-			} else if len(cookies) == 0 {
+				okLine += fmt.Sprintf("; live_cdp: injected %d cookies%s into %d context(s) at %s", len(pushable), expiredNote, liveCDPContexts, endpoint)
+			} else if len(pushable) == 0 {
 				okLine += fmt.Sprintf("; live_cdp: no cookies to inject (endpoint=%s)", endpoint)
 			}
 		}

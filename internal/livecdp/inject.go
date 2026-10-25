@@ -66,7 +66,12 @@ func Inject(ctx context.Context, cookies []chrome.Cookie) error {
 // real Set-Cookie navigation would. The dot is load-bearing: CDP
 // Network.setCookie stores a dot-less Domain host-only, which narrows a
 // parent-domain cookie to its apex and breaks delivery to app subdomains.
+//
+// Cookies already past their expiry are skipped: setting one is a delete in
+// Chrome, which would wipe the live cookie the browser minted for itself
+// (see chrome.IsExpiredAt).
 func BuildCookieParams(cookies []chrome.Cookie) []*network.CookieParam {
+	cookies, _ = chrome.DropExpired(cookies, time.Now())
 	params := make([]*network.CookieParam, 0, len(cookies))
 	for _, c := range cookies {
 		if p := buildParam(c); p != nil {

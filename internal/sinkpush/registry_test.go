@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mvanhorn/agentcookie/internal/chrome"
 )
@@ -194,5 +195,22 @@ func TestMatchLike_VariousPatterns(t *testing.T) {
 		if got := matchLike(tc.s, tc.p); got != tc.want {
 			t.Errorf("matchLike(%q, %q) = %v, want %v", tc.s, tc.p, got, tc.want)
 		}
+	}
+}
+
+// TestRunAll_SkipsExpiredCookies: no adapter is handed a cookie whose expiry
+// has passed. For a browser adapter (cmux) setting one is a delete.
+func TestRunAll_SkipsExpiredCookies(t *testing.T) {
+	resetForTesting()
+	a := &stubAdapter{name: "any", installed: true}
+	Register(a)
+
+	past := time.Now().Add(-time.Hour).UnixMicro() + chromeEpochOffsetSec*1_000_000
+	RunAll([]chrome.Cookie{
+		{HostKey: ".example.com", Name: "expired", Value: "1", ExpiresUTC: past},
+		{HostKey: ".example.com", Name: "session", Value: "2"},
+	})
+	if len(a.pushed) != 1 || len(a.pushed[0]) != 1 || a.pushed[0][0].Name != "session" {
+		t.Errorf("pushed = %v, want only the session cookie", a.pushed)
 	}
 }
