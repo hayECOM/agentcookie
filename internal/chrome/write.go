@@ -20,7 +20,12 @@ const chromeEpochDeltaMicros int64 = 11644473600 * 1000 * 1000
 // be running on the destination machine during this call (Chrome holds an
 // exclusive lock on Cookies when up). The spike documents this limitation; live
 // injection via CDP lands in U4.
+//
+// Already-expired cookies are skipped (see IsExpiredAt): upserting one over
+// the destination's live row replaces it with a dead one, which Chrome then
+// discards -- the same delete the CDP paths avoid.
 func WriteCookies(dbPath string, cookies []Cookie, key []byte) (int, error) {
+	cookies, _ = DropExpiredForPush(cookies, time.Now())
 	db, err := sql.Open("sqlite3", "file:"+dbPath+"?_journal=WAL&_busy_timeout=2000")
 	if err != nil {
 		return 0, fmt.Errorf("open destination cookies db: %w", err)

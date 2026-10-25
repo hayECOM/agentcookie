@@ -51,7 +51,7 @@ func RunAll(cookies []chrome.Cookie) []Result {
 	// Never hand an adapter a cookie that is already expired: for the
 	// browser adapters (cmux) setting one is a delete, and for the file
 	// adapters it is a dead credential. See chrome.IsExpiredAt.
-	cookies, _ = chrome.DropExpired(cookies, time.Now())
+	cookies, _ = chrome.DropExpiredForPush(cookies, time.Now())
 	adapters := All()
 	results := make([]Result, 0, len(adapters))
 	for _, a := range adapters {

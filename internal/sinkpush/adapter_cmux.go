@@ -138,10 +138,10 @@ func (a *CmuxAdapter) Push(cookies []chrome.Cookie) error {
 	// without this a malformed cookie would fail a whole batch.
 	// Expired cookies are skipped for the same reason: WebKit treats a
 	// cookie set with a past expiry as a delete (chrome.IsExpiredAt).
-	now := time.Now()
+	cutoff := time.Now().Add(chrome.PushExpiryMargin)
 	valid := make([]chrome.Cookie, 0, len(cookies))
 	for _, c := range cookies {
-		if Validate(c) == nil && !chrome.IsExpiredAt(c, now) {
+		if Validate(c) == nil && !chrome.IsExpiredAt(c, cutoff) {
 			valid = append(valid, c)
 		}
 	}

@@ -42,8 +42,11 @@ func InjectCookies(ctx context.Context, profileDir string, cookies []chrome.Cook
 	}
 	// An already-expired cookie set via Network.setCookies is a delete:
 	// it would wipe the live row the reader minted for itself. Skip them
-	// before both the twin convergence and the write (chrome.IsExpiredAt).
-	cookies, _ = chrome.DropExpired(cookies, time.Now())
+	// before the write (chrome.IsExpiredAt). The twin convergence still
+	// sees the full source set, so a host-only row the source carries only
+	// in expired form keeps protecting the reader's own live twin.
+	source := cookies
+	cookies, _ = chrome.DropExpiredForPush(cookies, time.Now())
 	if len(cookies) == 0 {
 		return nil
 	}
@@ -85,7 +88,7 @@ func InjectCookies(ctx context.Context, profileDir string, cookies []chrome.Cook
 		if err != nil {
 			return fmt.Errorf("Storage.getCookies: %w", err)
 		}
-		for _, del := range staleHostOnlyTwins(existing, cookies) {
+		for _, del := range staleHostOnlyTwins(existing, cookies, source) {
 			if err := del.Do(ctx); err != nil {
 				return fmt.Errorf("Network.deleteCookies: %w", err)
 			}
@@ -154,29 +157,28 @@ type twinKey struct {
 //
 // After one pass the profile has converged and this returns nothing, so
 // the steady-state cost is a single Storage.getCookies per sync.
-func staleHostOnlyTwins(existing []*network.Cookie, batch []chrome.Cookie) []*network.DeleteCookiesParams {
+//
+// source is the full set the source sent, of which batch is the part being
+// written (expired rows are skipped). A host-only identity anywhere in
+// source still protects the reader's twin: the source genuinely carries that
+// cookie, it is just not fresh enough to push this time.
+func staleHostOnlyTwins(existing []*network.Cookie, batch, source []chrome.Cookie) []*network.DeleteCookiesParams {
 	writesHostOnly := map[twinKey]bool{}
 	writesDotted := map[twinKey]bool{}
+	for _, c := range source {
+		if k, hostOnly, ok := batchTwinKey(c); ok && hostOnly {
+			writesHostOnly[k] = true
+		}
+	}
 	for _, c := range batch {
-		host := strings.TrimPrefix(c.HostKey, ".")
-		if host == "" || c.Name == "" {
+		k, hostOnly, ok := batchTwinKey(c)
+		if !ok {
 			continue
 		}
-		path := c.Path
-		if path == "" {
-			path = "/"
-		}
-		// Mirror buildCookieParam: __Host- cookies are always written
-		// host-only at path "/", whatever the source row says, so they
-		// must never be treated as the dotted half of a twin.
-		if strings.HasPrefix(c.Name, "__Host-") {
-			writesHostOnly[twinKey{host, c.Name, "/"}] = true
-			continue
-		}
-		if strings.HasPrefix(c.HostKey, ".") {
-			writesDotted[twinKey{host, c.Name, path}] = true
+		if hostOnly {
+			writesHostOnly[k] = true
 		} else {
-			writesHostOnly[twinKey{host, c.Name, path}] = true
+			writesDotted[k] = true
 		}
 	}
 
@@ -194,6 +196,26 @@ func staleHostOnlyTwins(existing []*network.Cookie, batch []chrome.Cookie) []*ne
 		deletes = append(deletes, network.DeleteCookies(k.name).WithDomain(k.host).WithPath(k.path))
 	}
 	return deletes
+}
+
+// batchTwinKey returns the twinKey a source row is written under, and
+// whether it is written host-only.
+func batchTwinKey(c chrome.Cookie) (twinKey, bool, bool) {
+	host := strings.TrimPrefix(c.HostKey, ".")
+	if host == "" || c.Name == "" {
+		return twinKey{}, false, false
+	}
+	path := c.Path
+	if path == "" {
+		path = "/"
+	}
+	// Mirror buildCookieParam: __Host- cookies are always written
+	// host-only at path "/", whatever the source row says, so they
+	// must never be treated as the dotted half of a twin.
+	if strings.HasPrefix(c.Name, "__Host-") {
+		return twinKey{host, c.Name, "/"}, true, true
+	}
+	return twinKey{host, c.Name, path}, !strings.HasPrefix(c.HostKey, "."), true
 }
 
 // buildCookieParam translates a chrome.Cookie row into a CDP

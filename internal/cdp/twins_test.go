@@ -36,7 +36,7 @@ func gotDeletes(t *testing.T, dels []*network.DeleteCookiesParams) map[string]bo
 // token. The stale row has to go.
 func TestStaleHostOnlyTwins_DeletesShadowedRow(t *testing.T) {
 	batch := []chrome.Cookie{{HostKey: ".example.com", Name: "sess", Path: "/"}}
-	dels := staleHostOnlyTwins(existing([3]string{"example.com", "sess", "/"}), batch)
+	dels := staleHostOnlyTwins(existing([3]string{"example.com", "sess", "/"}), batch, nil)
 	got := gotDeletes(t, dels)
 	if len(got) != 1 || !got["example.com|sess|/"] {
 		t.Errorf("expected the shadowed host-only row to be deleted, got %v", got)
@@ -53,7 +53,7 @@ func TestStaleHostOnlyTwins_KeepsLegitimateTwin(t *testing.T) {
 		{HostKey: ".example.com", Name: "OptanonConsent", Path: "/"},
 		{HostKey: "example.com", Name: "OptanonConsent", Path: "/"},
 	}
-	dels := staleHostOnlyTwins(existing([3]string{"example.com", "OptanonConsent", "/"}), batch)
+	dels := staleHostOnlyTwins(existing([3]string{"example.com", "OptanonConsent", "/"}), batch, nil)
 	if got := gotDeletes(t, dels); len(got) != 0 {
 		t.Errorf("a host-only cookie the source genuinely carries must never be deleted, got %v", got)
 	}
@@ -65,7 +65,7 @@ func TestStaleHostOnlyTwins_KeepsLegitimateTwin(t *testing.T) {
 // delete the row we are about to write.
 func TestStaleHostOnlyTwins_KeepsHostPrefixed(t *testing.T) {
 	batch := []chrome.Cookie{{HostKey: ".github.com", Name: "__Host-user_session_same_site", Path: "/app"}}
-	dels := staleHostOnlyTwins(existing([3]string{"github.com", "__Host-user_session_same_site", "/"}), batch)
+	dels := staleHostOnlyTwins(existing([3]string{"github.com", "__Host-user_session_same_site", "/"}), batch, nil)
 	if got := gotDeletes(t, dels); len(got) != 0 {
 		t.Errorf("__Host- cookies are written host-only and must not be converged away, got %v", got)
 	}
@@ -81,7 +81,7 @@ func TestStaleHostOnlyTwins_IgnoresUnrelatedRows(t *testing.T) {
 		[3]string{"example.com", "other", "/"},    // different name
 		[3]string{"example.com", "sess", "/deep"}, // different path
 		[3]string{".example.com", "sess", "/"},    // already dotted
-	), batch)
+	), batch, nil)
 	if got := gotDeletes(t, dels); len(got) != 0 {
 		t.Errorf("delete set must not widen beyond the exact shadowed row, got %v", got)
 	}
@@ -94,7 +94,7 @@ func TestStaleHostOnlyTwins_IgnoresUnrelatedRows(t *testing.T) {
 func TestStaleHostOnlyTwins_ConvergesOnce(t *testing.T) {
 	batch := []chrome.Cookie{{HostKey: ".example.com", Name: "sess", Path: "/"}}
 	converged := existing([3]string{".example.com", "sess", "/"})
-	if got := gotDeletes(t, staleHostOnlyTwins(converged, batch)); len(got) != 0 {
+	if got := gotDeletes(t, staleHostOnlyTwins(converged, batch, nil)); len(got) != 0 {
 		t.Errorf("a converged profile must plan no deletes, got %v", got)
 	}
 }
@@ -103,8 +103,22 @@ func TestStaleHostOnlyTwins_ConvergesOnce(t *testing.T) {
 // empty path, which buildCookieParam and Chrome both treat as "/".
 func TestStaleHostOnlyTwins_EmptyPathNormalizes(t *testing.T) {
 	batch := []chrome.Cookie{{HostKey: ".example.com", Name: "sess", Path: ""}}
-	got := gotDeletes(t, staleHostOnlyTwins(existing([3]string{"example.com", "sess", "/"}), batch))
+	got := gotDeletes(t, staleHostOnlyTwins(existing([3]string{"example.com", "sess", "/"}), batch, nil))
 	if len(got) != 1 || !got["example.com|sess|/"] {
 		t.Errorf("empty source path must normalize to / when matching twins, got %v", got)
+	}
+}
+
+// TestStaleHostOnlyTwins_ExpiredSourceRowStillProtects: the source carries
+// a legitimate host-only/dotted pair, but its host-only half has expired,
+// so the batch writes only the dotted row. The reader's own live host-only
+// twin must survive -- the source genuinely has that cookie, it is just not
+// fresh enough to push.
+func TestStaleHostOnlyTwins_ExpiredSourceRowStillProtects(t *testing.T) {
+	batch := []chrome.Cookie{{HostKey: ".example.com", Name: "sid", Path: "/"}}
+	source := append([]chrome.Cookie{{HostKey: "example.com", Name: "sid", Path: "/", ExpiresUTC: 1}}, batch...)
+	dels := staleHostOnlyTwins(existing([3]string{"example.com", "sid", "/"}), batch, source)
+	if got := gotDeletes(t, dels); len(got) != 0 {
+		t.Errorf("a host-only row the source carries (even expired) must protect the reader's twin, got %v", got)
 	}
 }

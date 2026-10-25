@@ -71,7 +71,7 @@ func Inject(ctx context.Context, cookies []chrome.Cookie) error {
 // Chrome, which would wipe the live cookie the browser minted for itself
 // (see chrome.IsExpiredAt).
 func BuildCookieParams(cookies []chrome.Cookie) []*network.CookieParam {
-	cookies, _ = chrome.DropExpired(cookies, time.Now())
+	cookies, _ = chrome.DropExpiredForPush(cookies, time.Now())
 	params := make([]*network.CookieParam, 0, len(cookies))
 	for _, c := range cookies {
 		if p := buildParam(c); p != nil {

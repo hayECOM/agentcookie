@@ -42,3 +42,18 @@ func TestDropExpired_KeepsSessionAndLiveCookies(t *testing.T) {
 		t.Error("DropExpired modified its input")
 	}
 }
+
+// TestDropExpiredForPush_AppliesMargin: a cookie that is about to expire is
+// skipped too -- a push is not instant, and one that lands expired is a
+// delete all the same.
+func TestDropExpiredForPush_AppliesMargin(t *testing.T) {
+	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	in := []Cookie{
+		{Name: "dying", ExpiresUTC: chromeMicros(now.Add(30 * time.Second))},
+		{Name: "live", ExpiresUTC: chromeMicros(now.Add(PushExpiryMargin + time.Minute))},
+	}
+	kept, dropped := DropExpiredForPush(in, now)
+	if dropped != 1 || len(kept) != 1 || kept[0].Name != "live" {
+		t.Errorf("kept = %+v (dropped %d), want only live", kept, dropped)
+	}
+}

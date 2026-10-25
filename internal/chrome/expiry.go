@@ -18,6 +18,20 @@ func IsExpiredAt(c Cookie, now time.Time) bool {
 	return !chromeTimeToUnix(c.ExpiresUTC).After(now)
 }
 
+// PushExpiryMargin is how close to its expiry a cookie may be and still be
+// pushed. A push is not instant -- the cold CDP path spends up to 15s
+// starting Chrome, cmux sets a big jar in batches -- so a cookie that passes
+// an exact check can arrive already expired and act as a delete anyway.
+// Skipping a cookie with under two minutes left costs nothing: the
+// destination keeps whatever it has.
+const PushExpiryMargin = 2 * time.Minute
+
+// DropExpiredForPush is DropExpired with PushExpiryMargin applied: the set a
+// push path may hand to a browser or a cookie store.
+func DropExpiredForPush(cookies []Cookie, now time.Time) ([]Cookie, int) {
+	return DropExpired(cookies, now.Add(PushExpiryMargin))
+}
+
 // DropExpired returns the cookies that are not expired at now, and how many
 // were dropped. The input slice is not modified.
 func DropExpired(cookies []Cookie, now time.Time) ([]Cookie, int) {

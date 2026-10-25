@@ -86,6 +86,30 @@ so any injector change that alters how a row is keyed (`host_key`, name, path)
 leaves the old rows behind rather than updating them. Ask what happens to the
 rows already on disk, not just what the next write produces.
 
+## Never push an expired cookie
+
+Setting a cookie whose expiry has passed is a **delete**, in Chrome
+(`Network`/`Storage.setCookies`, and a SQLite upsert Chrome then discards)
+and in WebKit (cmux). The source ships every row with its original expiry,
+so before 2026-10-25 this sink re-pushed the laptop's dead rows every ~30s and
+wiped the live cookies the destination browser had minted for itself --
+Apple's `shld_bt_*` shield cookies in the human Chrome, so Add to Bag
+answered HTTP 541 ("Page Not Found").
+
+Every push path now drops rows with a non-zero `ExpiresUTC` at or before
+now + `chrome.PushExpiryMargin` (2 min, because a push is not instant):
+`livecdp.BuildCookieParams`, `cdp.InjectCookies`, `chrome.WriteCookies`,
+`sinkpush.RunAll`, `CmuxAdapter.Push`. Session cookies (`ExpiresUTC == 0`)
+still push. The sidecar `cookies-plain.db` stays a verbatim mirror -- it is
+not a push. The cold injector's twin convergence still sees the full source
+set, so a host-only row the source carries only in expired form keeps
+protecting the reader's live twin. The sink log shows the count per push:
+`... pushed N cookies (skipped M expired) ...`. Guards:
+`TestSinkSync_NeverPushesExpiredCookies`, `TestBuildCookieParams_SkipsExpiredKeepsSession`,
+`TestCmuxPush_SkipsExpiredCookies`, `TestRunAll_SkipsExpiredCookies`,
+`TestWriteCookies_ExpiredNeverOverwritesLiveRow`,
+`TestStaleHostOnlyTwins_ExpiredSourceRowStillProtects`.
+
 ## Tests
 
 ```bash

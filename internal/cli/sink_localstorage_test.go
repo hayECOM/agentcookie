@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -225,11 +226,12 @@ func TestSinkLocalStorage_FailureDoesNotBreakTheCookiePath(t *testing.T) {
 // TestSinkSync_NeverPushesExpiredCookies is the guard for the 2026-10-25
 // Apple Add to Bag 541: the laptop's expired shield cookies rode every
 // /sync into the browser, and a cookie set with a past expiry is a delete.
-// The push surfaces must get only unexpired cookies (session cookies
-// included); the sidecar mirror is not a push and is not asserted here.
+// The handler counts what it skips on the per-push log line; the cold CDP
+// injector is handed the full set because it filters for itself and its
+// twin convergence needs every row the source carries.
 //
-// Guard-revert: hand cdpInject `cookies` instead of `pushable` in the
-// /sync handler and this goes red.
+// Guard-revert: drop the handler's DropExpiredForPush (push `cookies`
+// everywhere) and the count disappears from the log.
 func TestSinkSync_NeverPushesExpiredCookies(t *testing.T) {
 	var injected []chrome.Cookie
 	restore := SetCDPInjectorForTesting(func(_ context.Context, _ string, c []chrome.Cookie) error {
@@ -245,19 +247,21 @@ func TestSinkSync_NeverPushesExpiredCookies(t *testing.T) {
 	const chromeEpochOffsetMicros = 11644473600 * 1_000_000
 	past := time.Now().Add(-36*time.Hour).UnixMicro() + chromeEpochOffsetMicros
 	future := time.Now().Add(24*time.Hour).UnixMicro() + chromeEpochOffsetMicros
-	rec := f.post(t, 1, []chrome.Cookie{
-		{HostKey: ".example.com", Name: "shield", Value: "stale", Path: "/", ExpiresUTC: past},
-		{HostKey: ".example.com", Name: "session", Value: "s", Path: "/"},
-		{HostKey: ".example.com", Name: "live", Value: "l", Path: "/", ExpiresUTC: future},
-	}, nil)
+	var rec *httptest.ResponseRecorder
+	log := captureStderr(t, func() {
+		rec = f.post(t, 1, []chrome.Cookie{
+			{HostKey: ".example.com", Name: "shield", Value: "stale", Path: "/", ExpiresUTC: past},
+			{HostKey: ".example.com", Name: "session", Value: "s", Path: "/"},
+			{HostKey: ".example.com", Name: "live", Value: "l", Path: "/", ExpiresUTC: future},
+		}, nil)
+	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("/sync = %d, body %q", rec.Code, rec.Body.String())
 	}
-	var names []string
-	for _, c := range injected {
-		names = append(names, c.Name)
+	if !strings.Contains(log, "CDP injection pushed 2 cookies (skipped 1 expired)") {
+		t.Errorf("push log must count the skipped expired cookie, got:\n%s", log)
 	}
-	if len(names) != 2 || names[0] != "session" || names[1] != "live" {
-		t.Errorf("CDP injector got %v, want [session live] (expired cookie must be skipped)", names)
+	if len(injected) != 3 {
+		t.Errorf("cold CDP injector got %d cookies, want the full 3 (it filters itself)", len(injected))
 	}
 }

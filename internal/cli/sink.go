@@ -407,7 +407,9 @@ func newSinkMux(
 		// laptop's stale rows every sync wiped the cookies the destination
 		// browser minted for itself (chrome.IsExpiredAt). The push builders
 		// skip them too; filtering here is what gives the log its count.
-		pushable, expiredSkipped := chrome.DropExpired(cookies, time.Now())
+		// The cold CDP injector gets the full set: it filters itself, and
+		// its twin convergence needs every row the source carries.
+		pushable, expiredSkipped := chrome.DropExpiredForPush(cookies, time.Now())
 		expiredNote := ""
 		if expiredSkipped > 0 {
 			expiredNote = fmt.Sprintf(" (skipped %d expired)", expiredSkipped)
@@ -421,7 +423,7 @@ func newSinkMux(
 		}
 		if cfg.CDP.Enabled && len(pushable) > 0 {
 			profileDir := cdpProfileDir
-			if cdpErr := cdpInject(r.Context(), profileDir, pushable); cdpErr != nil {
+			if cdpErr := cdpInject(r.Context(), profileDir, cookies); cdpErr != nil {
 				fmt.Fprintf(os.Stderr, "agentcookie sink: CDP injection failed (sidecar write succeeded, PP CLIs unaffected): %v\n", cdpErr)
 			} else {
 				fmt.Fprintf(os.Stderr, "agentcookie sink: CDP injection pushed %d cookies%s into %s\n", len(pushable), expiredNote, profileDir)

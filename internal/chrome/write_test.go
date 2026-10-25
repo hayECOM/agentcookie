@@ -32,7 +32,7 @@ func TestWriteCookies_PlainV10RoundTrip(t *testing.T) {
 	seedEmptyCookiesDB(t, path)
 
 	in := []Cookie{
-		{HostKey: ".instacart.com", Name: "_session", Value: "instacart-session-token", Path: "/", IsSecure: 1, IsPersistent: 1, HasExpires: 1, ExpiresUTC: 13380163200000000},
+		{HostKey: ".instacart.com", Name: "_session", Value: "instacart-session-token", Path: "/", IsSecure: 1, IsPersistent: 1, HasExpires: 1, ExpiresUTC: 13600000000000000},
 		{HostKey: ".github.com", Name: "user_session", Value: "github-token-xyz", Path: "/", IsSecure: 1},
 	}
 	n, err := WriteCookies(path, in, testKey)
@@ -196,5 +196,35 @@ func TestWriteCookies_MetaVersionIdempotent(t *testing.T) {
 	}
 	if version != "18" || rowCount != 1 {
 		t.Errorf("idempotency: version=%q (want 18) rowCount=%d (want 1)", version, rowCount)
+	}
+}
+
+// TestWriteCookies_ExpiredNeverOverwritesLiveRow: upserting a source's
+// expired row over the destination's live one replaces it with a dead
+// cookie Chrome then discards. The live row must survive.
+func TestWriteCookies_ExpiredNeverOverwritesLiveRow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "Cookies")
+	seedEmptyCookiesDB(t, path)
+
+	live := Cookie{HostKey: ".example.com", Name: "shield", Value: "fresh", Path: "/", IsSecure: 1, HasExpires: 1, IsPersistent: 1, ExpiresUTC: 13600000000000000}
+	if _, err := WriteCookies(path, []Cookie{live}, testKey); err != nil {
+		t.Fatalf("seed live row: %v", err)
+	}
+	stale := live
+	stale.Value = "stale"
+	stale.ExpiresUTC = 13300000000000000 // 2022
+	n, err := WriteCookies(path, []Cookie{stale}, testKey)
+	if err != nil {
+		t.Fatalf("WriteCookies(stale): %v", err)
+	}
+	if n != 0 {
+		t.Errorf("wrote %d, want 0 (expired row must be skipped)", n)
+	}
+	got, err := ReadCookiesForHost(path, "%example.com", testKey)
+	if err != nil {
+		t.Fatalf("ReadCookiesForHost: %v", err)
+	}
+	if len(got) != 1 || got[0].Value != "fresh" {
+		t.Errorf("destination row = %#v, want the live value to survive", got)
 	}
 }
