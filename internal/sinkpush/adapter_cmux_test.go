@@ -21,6 +21,9 @@ type fakeCmux struct {
 	addIdx   int
 	listOut  string // workspace list --json response ("" = one default workspace)
 	listErr  error
+	treeOuts []string // tree --all --json responses, consumed in order; last repeats ("" = no browser surfaces)
+	treeErr  error
+	treeIdx  int
 	setErrs  []error // consumed in order, one per browser.cookies.set call
 	setCalls int
 
@@ -40,6 +43,17 @@ func (f *fakeCmux) run(args ...string) (string, error) {
 		out := f.listOut
 		if out == "" {
 			out = `{"workspaces":[{"ref":"workspace:2","title":"✳ Claude Code"}]}`
+		}
+		return out, nil
+	}
+	if len(args) >= 1 && args[0] == "tree" {
+		if f.treeErr != nil {
+			return "", f.treeErr
+		}
+		out := pickStrAt(f.treeOuts, f.treeIdx)
+		f.treeIdx++
+		if out == "" {
+			out = `{"windows":[{"workspaces":[{"panes":[{"surfaces":[{"ref":"surface:1","type":"terminal","url":null}]}]}]}]}`
 		}
 		return out, nil
 	}
@@ -676,5 +690,169 @@ func TestCmuxPush_SkipsExpiredCookies(t *testing.T) {
 	}
 	if len(sent) != 1 || strings.Contains(sent[0], `"expired"`) || !strings.Contains(sent[0], `"session"`) {
 		t.Errorf("browser.cookies.set payloads = %v, want one batch with only the session cookie", sent)
+	}
+}
+
+// cmuxTree builds a `cmux tree --all --json` response with one workspace per
+// group of surfaces. Each surface is "ref|type|url" (url "-" = JSON null).
+func cmuxTree(workspaces ...[]string) string {
+	type sf struct {
+		Ref  string  `json:"ref"`
+		Type string  `json:"type"`
+		URL  *string `json:"url"`
+	}
+	type pane struct {
+		Surfaces []sf `json:"surfaces"`
+	}
+	type ws struct {
+		Panes []pane `json:"panes"`
+	}
+	var wss []ws
+	for _, group := range workspaces {
+		var p pane
+		for _, spec := range group {
+			parts := strings.SplitN(spec, "|", 3)
+			s := sf{Ref: parts[0], Type: parts[1]}
+			if parts[2] != "-" {
+				u := parts[2]
+				s.URL = &u
+			}
+			p.Surfaces = append(p.Surfaces, s)
+		}
+		wss = append(wss, ws{Panes: []pane{p}})
+	}
+	b, _ := json.Marshal(map[string]any{"windows": []map[string]any{{"workspaces": wss}}})
+	return string(b)
+}
+
+// assertOnlyCookieSetsOn fails if any call other than tree/workspace-list
+// discovery touched sid -- a reused tab may be a live page, so it must only
+// ever receive browser.cookies.set (never navigate/focus/close/reload).
+func assertOnlyCookieSetsOn(t *testing.T, calls [][]string, sid string) {
+	t.Helper()
+	for _, c := range calls {
+		touches := false
+		for _, arg := range c {
+			if strings.Contains(arg, sid) {
+				touches = true
+			}
+		}
+		if !touches {
+			continue
+		}
+		if len(c) >= 2 && c[0] == "rpc" && c[1] == "browser.cookies.set" {
+			continue
+		}
+		t.Errorf("reused surface %s got a non-cookie call: %v", sid, c)
+	}
+}
+
+func TestCmuxPush_ReusesOpenBrowserSurface(t *testing.T) {
+	// A live page in one workspace and an about:blank tab in another: the
+	// blank one is preferred, nothing is added, and the reused tab only ever
+	// sees cookies.set.
+	f := &fakeCmux{treeOuts: []string{cmuxTree(
+		[]string{"surface:1|terminal|-", "surface:40|browser|https://eos-scorecard.example/"},
+		[]string{"surface:2|terminal|-", "surface:743|browser|"},
+	)}}
+	a := newTestCmux(f, nil)
+	if err := a.Push([]chrome.Cookie{{HostKey: ".x.com", Name: "a", Value: "1"}}); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if n := countAdds(f.calls); n != 0 {
+		t.Fatalf("an open browser surface exists; must not add a tab, got %d adds: %v", n, f.calls)
+	}
+	if a.surfaceID != "surface:743" {
+		t.Errorf("should prefer the about:blank tab surface:743, got %q", a.surfaceID)
+	}
+	assertOnlyCookieSetsOn(t, f.calls, "surface:743")
+}
+
+func TestCmuxPush_ReusesLivePageWhenNoBlankTab(t *testing.T) {
+	// Only a live page is open: reuse it rather than adding a tab, and never
+	// navigate, focus, reload or close it.
+	f := &fakeCmux{treeOuts: []string{cmuxTree(
+		[]string{"surface:1|terminal|-", "surface:40|browser|https://app.triplewhale.com/"},
+	)}}
+	a := newTestCmux(f, nil)
+	if err := a.Push([]chrome.Cookie{{HostKey: ".x.com", Name: "a", Value: "1"}}); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if n := countAdds(f.calls); n != 0 {
+		t.Fatalf("must reuse the live browser surface, got %d adds", n)
+	}
+	if a.surfaceID != "surface:40" {
+		t.Errorf("want surface:40, got %q", a.surfaceID)
+	}
+	assertOnlyCookieSetsOn(t, f.calls, "surface:40")
+	for _, c := range f.calls {
+		if len(c) >= 2 && c[0] == "rpc" && c[1] != "browser.cookies.set" {
+			t.Errorf("unexpected rpc against cmux: %v", c)
+		}
+	}
+}
+
+func TestCmuxPush_NoBrowserSurfaceAddsOne(t *testing.T) {
+	// Terminals only: fall back to adding exactly one unfocused about:blank tab.
+	f := &fakeCmux{treeOuts: []string{cmuxTree([]string{"surface:1|terminal|-"})}}
+	a := newTestCmux(f, nil)
+	if err := a.Push([]chrome.Cookie{{HostKey: ".x.com", Name: "a", Value: "1"}}); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	add := findCall(f.calls, "new-surface")
+	if add == nil || countAdds(f.calls) != 1 {
+		t.Fatalf("expected exactly one added tab, got %v", f.calls)
+	}
+	if !hasFlag(add, "--focus", "false") || !hasFlag(add, "--url", "about:blank") {
+		t.Errorf("added tab must be unfocused about:blank, got %v", add)
+	}
+}
+
+func TestCmuxPush_StaleCacheReusesAnotherSurface(t *testing.T) {
+	// The cached surface is gone (user closed it). The reopen path must
+	// reuse another open browser tab -- skipping the stale ref even if the
+	// tree still lists it -- instead of adding a new one.
+	f := &fakeCmux{
+		treeOuts: []string{cmuxTree(
+			[]string{"surface:12|browser|"},
+			[]string{"surface:55|browser|https://github.com/"},
+		)},
+		setErrs: []error{errors.New("not_found: Surface not found")},
+	}
+	a := newTestCmux(f, nil)
+	a.surfaceID = "surface:12"
+	if err := a.Push([]chrome.Cookie{{HostKey: ".x.com", Name: "a", Value: "1"}}); err != nil {
+		t.Fatalf("Push should recover by reusing another surface, got %v", err)
+	}
+	if n := countAdds(f.calls); n != 0 {
+		t.Fatalf("another browser surface is open; must not add a tab, got %d adds", n)
+	}
+	if a.surfaceID != "surface:55" {
+		t.Errorf("reopen should reuse surface:55, got %q", a.surfaceID)
+	}
+	assertOnlyCookieSetsOn(t, f.calls, "surface:55")
+}
+
+func TestCmuxPush_TreeUnavailableHardFails(t *testing.T) {
+	// cmux down at discovery time: fail, do not try to add a tab.
+	f := &fakeCmux{treeErr: errors.New("dial unix: connection refused")}
+	a := newTestCmux(f, nil)
+	if err := a.Push([]chrome.Cookie{{HostKey: ".x.com", Name: "a", Value: "1"}}); err == nil {
+		t.Fatal("expected an error when cmux is unreachable")
+	}
+	if countAdds(f.calls) != 0 {
+		t.Errorf("must not add a tab when cmux is unreachable: %v", f.calls)
+	}
+}
+
+func TestCmuxPush_TreeUnparseableFallsBackToAdd(t *testing.T) {
+	// An older cmux without `tree --json`: still deliver, via an added tab.
+	f := &fakeCmux{treeErr: errors.New("unknown flag --json")}
+	a := newTestCmux(f, nil)
+	if err := a.Push([]chrome.Cookie{{HostKey: ".x.com", Name: "a", Value: "1"}}); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if countAdds(f.calls) != 1 {
+		t.Errorf("expected a fallback add, got %v", f.calls)
 	}
 }

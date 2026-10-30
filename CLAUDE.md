@@ -165,6 +165,36 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.agentcookie.sink.pli
 Cookies only flush to SQLite on a clean browser shutdown, so always
 `agent-browser close --all` before the post-launch read.
 
+## The cmux lane reuses an open browser tab -- it does not add one
+
+`browser.cookies.set` needs a browser `surface_id`, but WebKit cookies land
+at the profile level, so any open browser surface works. Before 2026-10-30
+the adapter (`internal/sinkpush/adapter_cmux.go`) added its own unfocused
+`about:blank` tab to the first workspace every time its cache was empty --
+every sink restart and every time Rony closed it -- and stray "New tab"
+browsers piled up.
+
+Now `ensureSurfaceLocked` reads `cmux tree --all --json` and reuses an open
+browser surface (an about:blank one first, else any), in any workspace. It
+adds a tab only when no browser surface is open at all, or when `tree` is
+unusable but cmux is reachable. The stale-cache reopen path does the same
+and skips the ref that just failed.
+
+**A reused tab may be a live page** (eos-scorecard, a Triple Whale
+session). The injection path only ever calls `browser.cookies.set` on it --
+never navigate, reload, focus or close. The doctor/cmux-sync auth probe
+(`verify.go`) navigates, so it keeps opening and closing its own surface;
+do not "unify" it onto the reuse path. The opt-in live test only closes a
+surface that was not open before its Push. Guards:
+`TestCmuxPush_ReusesOpenBrowserSurface`,
+`TestCmuxPush_ReusesLivePageWhenNoBlankTab`,
+`TestCmuxPush_StaleCacheReusesAnotherSurface`,
+`TestCmuxPush_NoBrowserSurfaceAddsOne`.
+
+Caveat: cmux exposes no per-surface browser profile in `tree`. If a
+non-default `--profile` browser tab is ever the only one open, cookies would
+land in that profile's store.
+
 ## localStorage: how it reaches this sink (and how it must never reach it)
 
 Upstream has carried localStorage + IndexedDB sync since v0.7 (protocol v2,

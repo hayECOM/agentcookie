@@ -39,22 +39,31 @@ var surfaceRefRE = regexp.MustCompile(`surface:\d+`)
 // internal/cli/sink.go at sink startup rather than in init.go, because
 // it carries config (binary path, host filter) that init() cannot see.
 //
-// Injection surface (why a hidden background tab, not a workspace):
-// browser.cookies.set requires a browser surface_id -- there is no
-// profile-level set call. But WebKit cookies persist at the
+// Injection surface (reuse an open browser tab; add one only as a last
+// resort): browser.cookies.set requires a browser surface_id -- there is
+// no profile-level set call. But WebKit cookies persist at the
 // WKWebsiteDataStore (profile) level, shared across every browser
 // surface and surviving pane close (confirmed empirically: a set on one
 // surface is visible to cookies.get on any other). So the surface only
-// has to exist; it never has to be seen. The adapter adds ONE unfocused
-// (`--focus false`) about:blank browser tab to an existing workspace's
-// active pane and caches it. A non-selected browser tab is a hidden
-// webview -- cookies.set still lands on it -- so the only UI artifact is
-// a small tab chip; nothing opens in the user's view and nothing appears
-// in the workspace sidebar. An earlier design parked the surface in a
-// dedicated "agentcookie" workspace, which showed in the sidebar and
-// (because cmux short refs renumber across restarts) could alias a live
-// user workspace and pop the pane into focus; the hidden-tab approach
-// removes the workspace entirely.
+// has to exist; it never has to be seen, and it does not have to be ours.
+// The adapter therefore REUSES a browser surface that is already open in
+// any workspace (`cmux tree --all --json`), preferring an about:blank tab
+// over a live page, and caches it. Only when no browser surface exists
+// at all does it add ONE unfocused (`--focus false`) about:blank tab to
+// the first workspace's active pane.
+//
+// A reused surface may be a live user or agent page (a dashboard, a
+// logged-in session). The adapter only ever calls browser.cookies.set
+// against it -- never navigate, reload, focus or close. The auth probe in
+// verify.go, which must navigate, opens and closes its own surface.
+//
+// Why reuse: an earlier design always added its own hidden tab whenever
+// the cache was empty -- on every sink restart and every time the user
+// closed it -- so stray "New tab" browsers piled up in the first
+// workspace. Before that, the surface lived in a dedicated "agentcookie"
+// workspace, which showed in the sidebar and (because cmux short refs
+// renumber across restarts) could alias a live user workspace and pop the
+// pane into focus.
 //
 // WebKit cookie semantics (confirmed empirically, differ from Chrome's
 // CDP path):
@@ -76,7 +85,7 @@ type CmuxAdapter struct {
 	domainFilter []string
 
 	mu        sync.Mutex
-	surfaceID string // cached hidden background tab ref, added lazily, reused
+	surfaceID string // cached injection surface ref (reused or, last resort, added)
 
 	// run executes a cmux subcommand and returns stdout. Swappable in
 	// tests; defaults to execCmux.
@@ -123,9 +132,10 @@ func (a *CmuxAdapter) IsInstalled() bool {
 func (a *CmuxAdapter) CookieHostPatterns() []string { return a.domainFilter }
 
 // Push injects each cookie into cmux's WebKit browser via
-// `cmux rpc browser.cookies.set`. It ensures a cached hidden background
-// tab exists (adding one unfocused about:blank tab on first use), and
-// re-adds once if the cached surface has gone away. Errors are returned
+// `cmux rpc browser.cookies.set`. It ensures a cached injection surface
+// (an already-open browser tab, or an unfocused about:blank tab added only
+// when none is open), and re-resolves once if the cached surface has gone
+// away. Errors are returned
 // for RunAll to log; a missing or cmuxOnly-gated cmux is a soft failure
 // that never aborts the sync or the other surfaces.
 func (a *CmuxAdapter) Push(cookies []chrome.Cookie) error {
@@ -153,7 +163,7 @@ func (a *CmuxAdapter) Push(cookies []chrome.Cookie) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if _, err := a.ensureSurfaceLocked(); err != nil {
+	if _, err := a.ensureSurfaceLocked(""); err != nil {
 		return fmt.Errorf("cmux: open browser surface: %w", err)
 	}
 
@@ -169,12 +179,15 @@ func (a *CmuxAdapter) Push(cookies []chrome.Cookie) error {
 		if err == nil {
 			continue
 		}
-		// The cached surface may have been closed between syncs. Reopen
-		// once and retry this chunk before giving up.
+		// The cached surface may have been closed between syncs. Re-resolve
+		// once (reusing another open browser tab before adding one) and
+		// retry this chunk before giving up. The stale ref is excluded so a
+		// surface that just failed is never picked again.
 		if !reopened && isSurfaceError(err) {
 			reopened = true
+			stale := a.surfaceID
 			a.surfaceID = ""
-			if _, oerr := a.ensureSurfaceLocked(); oerr != nil {
+			if _, oerr := a.ensureSurfaceLocked(stale); oerr != nil {
 				return fmt.Errorf("cmux: reopen surface after %v: %w", err, oerr)
 			}
 			if rerr := a.setCookiesLocked(chunk); rerr == nil {
@@ -206,14 +219,30 @@ func (a *CmuxAdapter) Push(cookies []chrome.Cookie) error {
 	return nil
 }
 
-// ensureSurfaceLocked returns the cached injection surface ref, adding an
-// unfocused about:blank browser tab to an existing workspace if none is
-// cached. The tab is hidden (a non-selected webview) -- cookies.set lands
-// on it without it ever being shown, and it adds no sidebar entry.
+// ensureSurfaceLocked returns the cached injection surface ref. With no
+// cache it first reuses a browser surface that is already open anywhere in
+// cmux (see reusableBrowserSurface), and only when there is none adds an
+// unfocused about:blank browser tab to an existing workspace. avoid is a
+// surface ref that must not be picked (the one that just failed); "" for
+// none. A reused surface is only ever the target of browser.cookies.set --
+// nothing here navigates, focuses or closes it.
 // Caller must hold a.mu.
-func (a *CmuxAdapter) ensureSurfaceLocked() (string, error) {
+func (a *CmuxAdapter) ensureSurfaceLocked(avoid string) (string, error) {
 	if a.surfaceID != "" {
 		return a.surfaceID, nil
+	}
+	treeOut, err := a.run("tree", "--all", "--json")
+	if err != nil && isCmuxUnavailable(err) {
+		return "", err
+	}
+	// Any other discovery failure (an older cmux without `tree --json`,
+	// unparseable output) falls through to adding a tab: one stray tab
+	// beats no delivery.
+	if err == nil {
+		if sid := reusableBrowserSurface(treeOut, avoid); sid != "" {
+			a.surfaceID = sid
+			return sid, nil
+		}
 	}
 	ws, err := a.hostWorkspaceLocked()
 	if err != nil {
@@ -234,8 +263,55 @@ func (a *CmuxAdapter) ensureSurfaceLocked() (string, error) {
 	return sid, nil
 }
 
-// hostWorkspaceLocked returns a workspace to host the hidden injection
-// tab: the first workspace cmux reports. The cmux-sync LaunchAgent runs
+// reusableBrowserSurface picks an already-open browser surface from `cmux
+// tree --all --json` output: the first about:blank one (empty url, as cmux
+// reports a fresh tab) if any, else the first browser surface of any kind.
+// avoid is skipped. Returns "" when there is none or the JSON is
+// unparseable.
+func reusableBrowserSurface(treeJSON, avoid string) string {
+	var parsed struct {
+		Windows []struct {
+			Workspaces []struct {
+				Panes []struct {
+					Surfaces []struct {
+						Ref  string  `json:"ref"`
+						Type string  `json:"type"`
+						URL  *string `json:"url"`
+					} `json:"surfaces"`
+				} `json:"panes"`
+			} `json:"workspaces"`
+		} `json:"windows"`
+	}
+	if err := json.Unmarshal([]byte(treeJSON), &parsed); err != nil {
+		return ""
+	}
+	var blank, first string
+	for _, w := range parsed.Windows {
+		for _, ws := range w.Workspaces {
+			for _, p := range ws.Panes {
+				for _, sf := range p.Surfaces {
+					if sf.Type != "browser" || sf.Ref == "" || sf.Ref == avoid {
+						continue
+					}
+					if first == "" {
+						first = sf.Ref
+					}
+					if blank == "" && (sf.URL == nil || *sf.URL == "" || *sf.URL == "about:blank") {
+						blank = sf.Ref
+					}
+				}
+			}
+		}
+	}
+	if blank != "" {
+		return blank
+	}
+	return first
+}
+
+// hostWorkspaceLocked returns a workspace to host an added injection tab
+// (only when no browser surface is open to reuse): the first workspace
+// cmux reports. The cmux-sync LaunchAgent runs
 // outside cmux ($CMUX_WORKSPACE_ID unset), so there is no caller
 // workspace to default to; the first listed one is a stable, already-open
 // home that costs no new workspace and no sidebar entry. Resolved fresh

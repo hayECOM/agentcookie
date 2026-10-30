@@ -3,6 +3,7 @@ package sinkpush
 import (
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/mvanhorn/agentcookie/internal/chrome"
@@ -43,6 +44,9 @@ func TestCmuxLiveInjection(t *testing.T) {
 		{HostKey: host, Name: "ac_live_temp", Value: "sessioncookie", Path: "/"}, // no expiry -> session
 	}
 
+	// Push may REUSE an already-open browser tab (possibly a live page), so
+	// remember what was open before and only close a surface Push added.
+	preTree, _ := a.run("tree", "--all", "--json")
 	if err := a.Push(cookies); err != nil {
 		t.Fatalf("Push to live cmux failed: %v", err)
 	}
@@ -51,7 +55,9 @@ func TestCmuxLiveInjection(t *testing.T) {
 			return
 		}
 		_, _ = a.run("browser", "--surface", a.surfaceID, "cookies", "clear", "--url", url)
-		_, _ = a.run("rpc", "surface.close", `{"surface_id":"`+a.surfaceID+`"}`)
+		if !strings.Contains(preTree, `"`+a.surfaceID+`"`) {
+			_, _ = a.run("rpc", "surface.close", `{"surface_id":"`+a.surfaceID+`"}`)
+		}
 	})
 
 	if a.surfaceID == "" {
