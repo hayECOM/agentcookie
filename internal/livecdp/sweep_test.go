@@ -152,6 +152,29 @@ func TestCloseStaleBlanks_KeepsAPage(t *testing.T) {
 	}
 }
 
+// TestCloseStaleBlanks_StopsWhenSparedCandidateIsGone covers the live page
+// count, which the spare-last-candidate floor cannot: when another client
+// closed the spared candidate before the listing, closing the rest could
+// leave no page at all.
+func TestCloseStaleBlanks_StopsWhenSparedCandidateIsGone(t *testing.T) {
+	noClosePause(t)
+	fb := &fakeBrowser{targets: []*target.Info{blankTab("a"), blankTab("b")}}
+	candidates := fb.candidates()
+	fb.remove("b")
+	if got := fb.sweep(t, candidates); len(got) != 0 {
+		t.Fatalf("closed %v, want none: a is the browser's only page", got)
+	}
+
+	// A prerender target does not count as the surviving page.
+	prerender := &target.Info{TargetID: "pre", Type: "page", Subtype: "prerender", URL: "https://x.com/", BrowserContextID: testDefaultCtx}
+	fb = &fakeBrowser{targets: []*target.Info{blankTab("a"), blankTab("b"), prerender}}
+	candidates = fb.candidates()
+	fb.remove("b")
+	if got := fb.sweep(t, candidates); len(got) != 0 {
+		t.Fatalf("closed %v, want none: a is the only page besides a prerender", got)
+	}
+}
+
 // TestCloseStaleBlanks_ClearsLargePileWithFewListings guards the budget:
 // a pile of thousands must not cost one full listing per close.
 func TestCloseStaleBlanks_ClearsLargePileWithFewListings(t *testing.T) {
