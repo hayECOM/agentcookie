@@ -1497,3 +1497,44 @@ func TestLiveCDPSweepStartsOnlyWhenLiveCDPModifiesChrome(t *testing.T) {
 		t.Fatal("sweep never ran")
 	}
 }
+
+func TestRunLiveCDPSweepPassesUntilClean(t *testing.T) {
+	prev := liveCDPSweep
+	t.Cleanup(func() { liveCDPSweep = prev })
+
+	run := func(results []int, errs []error) int {
+		calls := 0
+		liveCDPSweep = func(ctx context.Context, _ string, _ time.Duration) (int, error) {
+			if dl, ok := ctx.Deadline(); !ok || time.Until(dl) < liveCDPSweepPassBudget-time.Second {
+				t.Errorf("pass %d: deadline %v, want a fresh %s budget", calls+1, dl, liveCDPSweepPassBudget)
+			}
+			i := calls
+			calls++
+			if i >= len(results) {
+				return 0, nil
+			}
+			return results[i], errs[i]
+		}
+		runLiveCDPSweep(context.Background(), "http://127.0.0.1:9333")
+		return calls
+	}
+
+	// A pass that runs out of time mid-pile is followed by another.
+	timeout := context.DeadlineExceeded
+	if got := run([]int{1200, 1100, 600, 0}, []error{timeout, timeout, nil, nil}); got != 4 {
+		t.Fatalf("passes = %d, want 4 (until one closes nothing)", got)
+	}
+	// A pass that fails without closing anything ends the sweep.
+	if got := run([]int{0}, []error{errors.New("unreachable")}); got != 1 {
+		t.Fatalf("passes after a failed empty pass = %d, want 1", got)
+	}
+	// A browser that keeps growing blanks is capped.
+	many := make([]int, 50)
+	manyErrs := make([]error, 50)
+	for i := range many {
+		many[i] = 1
+	}
+	if got := run(many, manyErrs); got != liveCDPSweepMaxPasses {
+		t.Fatalf("passes = %d, want the %d cap", got, liveCDPSweepMaxPasses)
+	}
+}

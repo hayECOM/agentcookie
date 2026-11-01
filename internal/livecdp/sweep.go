@@ -15,16 +15,18 @@ import (
 // client may have just opened a blank tab it is about to navigate.
 const DefaultSweepMinAge = 60 * time.Second
 
-// SweepStaleBlankTabs closes the about:blank tabs left in the Chrome at
-// endpoint by earlier attach-and-inject runs, which leaked one tab per
-// inject. CDP reports no target creation time, so age is observed: it lists
-// the targets, waits minAge, lists again, and picks page targets that were
-// about:blank both times. Each pick is checked again against a fresh listing
-// right before it is closed. It never closes a page with a real URL, a
-// non-page target (service worker, extension, browser UI), a tab outside the
-// default browser context (an agent's own context, incognito), or the last
-// page, which on Linux would quit the browser. It returns the number of tabs
-// closed.
+// SweepStaleBlankTabs makes one sweep pass over the Chrome at endpoint,
+// closing the about:blank tabs earlier attach-and-inject runs leaked (one
+// per inject). CDP reports no target creation time, so age is observed: it
+// lists the targets, waits minAge, lists again, and picks tabs that were
+// sweepable both times. Each pick is checked again against a listing taken
+// at most sweepRelistEvery closes earlier. It never closes a page with a
+// real URL, a tab a client is attached to, a popup a page opened, a
+// non-page target (service worker, extension, browser UI), a tab outside
+// the default browser context (an agent's own context, incognito), or the
+// last page, which on Linux would quit the browser. It returns the number
+// of tabs closed; a caller with a large pile runs passes until one closes
+// none.
 func SweepStaleBlankTabs(ctx context.Context, endpoint string, minAge time.Duration) (int, error) {
 	if endpoint == "" {
 		endpoint = DefaultCDPEndpoint
@@ -69,7 +71,7 @@ func SweepStaleBlankTabs(ctx context.Context, endpoint string, minAge time.Durat
 
 	list := func() ([]*target.Info, error) { return chromedp.Targets(browserCtx) }
 	closeTarget := func(id target.ID) error { return target.CloseTarget(id).Do(bctx) }
-	return closeStaleBlanks(staleBlankTargets(first, second, defaultID), list, closeTarget, defaultID)
+	return closeStaleBlanks(ctx, staleBlankTargets(first, second, defaultID), list, closeTarget, defaultID)
 }
 
 // staleBlankTargets picks the sweep candidates from two listings taken at
@@ -92,24 +94,58 @@ func staleBlankTargets(first, second []*target.Info, defaultID cdp.BrowserContex
 	return stale
 }
 
-// closeStaleBlanks closes the candidates one at a time. Before each close it
-// lists the targets again and skips a candidate that is gone, is no longer a
-// blank default-context tab, or has been attached to since it was sampled.
-// It stops once only one page would remain.
-func closeStaleBlanks(candidates []*target.Info, list func() ([]*target.Info, error), closeTarget func(target.ID) error, defaultID cdp.BrowserContextID) (int, error) {
+// sweepRelistEvery is how many closes the sweep makes per fresh target
+// listing. Listing before every close was O(N^2) against a browser holding
+// thousands of leaked tabs and outran the sweep's budget.
+const sweepRelistEvery = 50
+
+// sweepClosePause spaces closes so the sweep does not crowd out the sink's
+// own CDP injects right after a restart. Tests set it to zero.
+var sweepClosePause = 10 * time.Millisecond
+
+// closeStaleBlanks closes the candidates one at a time. It lists the targets
+// again before the first close and after every sweepRelistEvery closes, and
+// checks each candidate against the latest listing: one that is gone or is
+// no longer a sweepable blank tab is skipped. Tabs it closed since that
+// listing are counted out of the page total, and it stops once only one
+// page would remain. Because a listing can be up to sweepRelistEvery closes
+// old, another client may have closed the real pages since; the last
+// candidate is therefore never closed, so a page always survives the pass.
+func closeStaleBlanks(ctx context.Context, candidates []*target.Info, list func() ([]*target.Info, error), closeTarget func(target.ID) error, defaultID cdp.BrowserContextID) (int, error) {
 	closed := 0
 	var firstErr error
+	var latest map[target.ID]*target.Info
+	pages, sinceList := 0, sweepRelistEvery
+	if len(candidates) > 0 {
+		candidates = candidates[:len(candidates)-1]
+	}
 	for _, sampled := range candidates {
-		live, err := list()
-		if err != nil {
-			return closed, fmt.Errorf("livecdp: sweep: list targets: %w", err)
+		if sinceList >= sweepRelistEvery {
+			live, err := list()
+			if err != nil {
+				return closed, fmt.Errorf("livecdp: sweep: list targets: %w", err)
+			}
+			latest = make(map[target.ID]*target.Info, len(live))
+			for _, info := range live {
+				if info != nil {
+					latest[info.TargetID] = info
+				}
+			}
+			pages, sinceList = livePages(live), 0
 		}
-		if livePages(live) <= 1 {
+		if pages <= 1 {
 			break
 		}
-		cur := findTarget(live, sampled.TargetID)
-		if !isSweepableBlank(cur, defaultID) || (cur.Attached && !sampled.Attached) {
+		cur := latest[sampled.TargetID]
+		if !isSweepableBlank(cur, defaultID) {
 			continue
+		}
+		if closed > 0 && sweepClosePause > 0 {
+			select {
+			case <-ctx.Done():
+				return closed, ctx.Err()
+			case <-time.After(sweepClosePause):
+			}
 		}
 		if err := closeTarget(cur.TargetID); err != nil {
 			if firstErr == nil {
@@ -117,6 +153,9 @@ func closeStaleBlanks(candidates []*target.Info, list func() ([]*target.Info, er
 			}
 			continue
 		}
+		delete(latest, cur.TargetID)
+		pages--
+		sinceList++
 		closed++
 	}
 	return closed, firstErr
@@ -134,18 +173,20 @@ func livePages(infos []*target.Info) int {
 	return n
 }
 
-func findTarget(infos []*target.Info, id target.ID) *target.Info {
-	for _, info := range infos {
-		if info != nil && info.TargetID == id {
-			return info
-		}
-	}
-	return nil
-}
-
-// isSweepableBlank reports whether info is a plain about:blank tab in the
-// default browser context.
+// isSweepableBlank reports whether info looks like a leaked inject tab: a
+// plain about:blank page in the default browser context that no client is
+// attached to and no page opened. It is checked in every observation, so a
+// tab attached in any of them is spared.
+//
+// Attached tabs are spared even if they were leaked: a Puppeteer or
+// Playwright client auto-attaches to every page, including an idle tab it
+// parked at about:blank. While such a client is connected the sweep closes
+// nothing; the leak itself is fixed, and later quiet sink starts drain the
+// pile. A tab with an opener is a page-made popup (window.open(”) then
+// document.write), which keeps the about:blank URL while showing real
+// content; the leaked tabs came from Target.createTarget and have none.
 func isSweepableBlank(info *target.Info, defaultID cdp.BrowserContextID) bool {
 	return info != nil && info.Type == "page" && info.Subtype == "" &&
-		info.URL == "about:blank" && info.BrowserContextID == defaultID
+		info.URL == "about:blank" && info.BrowserContextID == defaultID &&
+		!info.Attached && info.OpenerID == ""
 }

@@ -2,6 +2,7 @@ package livecdp
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -36,9 +37,15 @@ func TestStaleBlankTargets(t *testing.T) {
 	incognito := &target.Info{TargetID: "incog", Type: "page", URL: "about:blank", BrowserContextID: "incognitoctx"}
 	prerender := &target.Info{TargetID: "pre", Type: "page", Subtype: "prerender", URL: "about:blank", BrowserContextID: testDefaultCtx}
 	worker := &target.Info{TargetID: "sw", Type: "service_worker", URL: "about:blank", BrowserContextID: testDefaultCtx}
+	// A lane's idle tab parked at about:blank stays attached in both samples.
+	parked := blankTab("parked")
+	parked.Attached = true
+	// window.open('') + document.write: real content under an about:blank URL.
+	popup := blankTab("popup")
+	popup.OpenerID = "real"
 
-	first := []*target.Info{stale1, stale2, realTab("real"), blankTab("navigated"), agent, incognito, prerender, worker, nil}
-	second := []*target.Info{stale1, stale2, realTab("real"), navigated, blankTab("fresh"), agent, incognito, prerender, worker, nil}
+	first := []*target.Info{stale1, stale2, realTab("real"), blankTab("navigated"), agent, incognito, prerender, worker, parked, popup, nil}
+	second := []*target.Info{stale1, stale2, realTab("real"), navigated, blankTab("fresh"), agent, incognito, prerender, worker, parked, popup, nil}
 
 	var got []target.ID
 	for _, info := range staleBlankTargets(first, second, testDefaultCtx) {
@@ -56,10 +63,12 @@ func TestStaleBlankTargets(t *testing.T) {
 type fakeBrowser struct {
 	targets []*target.Info
 	closed  []target.ID
+	lists   int
 	onClose func(fb *fakeBrowser)
 }
 
 func (fb *fakeBrowser) list() ([]*target.Info, error) {
+	fb.lists++
 	out := make([]*target.Info, 0, len(fb.targets))
 	for _, info := range fb.targets {
 		c := *info
@@ -82,55 +91,86 @@ func (fb *fakeBrowser) remove(id target.ID) {
 }
 
 func (fb *fakeBrowser) find(id target.ID) *target.Info {
-	return findTarget(fb.targets, id)
+	for _, info := range fb.targets {
+		if info.TargetID == id {
+			return info
+		}
+	}
+	return nil
 }
 
-func (fb *fakeBrowser) sweep(t *testing.T) []target.ID {
+// candidates samples the sweepable tabs, as the two listings would.
+func (fb *fakeBrowser) candidates() []*target.Info {
+	all, _ := fb.list()
+	fb.lists = 0
+	return slices.DeleteFunc(all, func(info *target.Info) bool { return !isSweepableBlank(info, testDefaultCtx) })
+}
+
+func (fb *fakeBrowser) sweep(t *testing.T, candidates []*target.Info) []target.ID {
 	t.Helper()
-	candidates, _ := fb.list()
-	candidates = slices.DeleteFunc(candidates, func(info *target.Info) bool { return !isSweepableBlank(info, testDefaultCtx) })
-	if _, err := closeStaleBlanks(candidates, fb.list, fb.close, testDefaultCtx); err != nil {
+	if _, err := closeStaleBlanks(context.Background(), candidates, fb.list, fb.close, testDefaultCtx); err != nil {
 		t.Fatal(err)
 	}
 	return fb.closed
 }
 
-func TestCloseStaleBlanks_RevalidatesEachCandidate(t *testing.T) {
-	fb := &fakeBrowser{targets: []*target.Info{blankTab("a"), blankTab("b"), blankTab("c"), realTab("real")}}
-	// While a closes, another client navigates b and attaches to c.
-	fb.onClose = func(fb *fakeBrowser) {
-		if b := fb.find("b"); b != nil {
-			b.URL = "https://example.com/"
-		}
-		if c := fb.find("c"); c != nil {
-			c.Attached = true
-		}
-		fb.onClose = nil
-	}
-	if got := fb.sweep(t); !slices.Equal(got, []target.ID{"a"}) {
-		t.Fatalf("closed %v, want only [a]: b was navigated and c claimed after sampling", got)
+func noClosePause(t *testing.T) {
+	prev := sweepClosePause
+	sweepClosePause = 0
+	t.Cleanup(func() { sweepClosePause = prev })
+}
+
+func TestCloseStaleBlanks_RevalidatesCandidates(t *testing.T) {
+	noClosePause(t)
+	fb := &fakeBrowser{targets: []*target.Info{blankTab("a"), blankTab("b"), blankTab("c"), blankTab("d"), blankTab("e"), realTab("real")}}
+	candidates := fb.candidates()
+	// After sampling, another client navigates b, attaches to c, and
+	// closes d.
+	fb.find("b").URL = "https://example.com/"
+	fb.find("c").Attached = true
+	fb.remove("d")
+	if got := fb.sweep(t, candidates); !slices.Equal(got, []target.ID{"a"}) {
+		t.Fatalf("closed %v, want only [a]: b, c, d changed after sampling and e is the spared last candidate", got)
 	}
 }
 
-func TestCloseStaleBlanks_KeepsLastLivePage(t *testing.T) {
+func TestCloseStaleBlanks_KeepsAPage(t *testing.T) {
+	noClosePause(t)
 	fb := &fakeBrowser{targets: []*target.Info{blankTab("a"), blankTab("b"), realTab("real")}}
-	// After a closes, another client closes the only real page.
+	// After a closes, another client closes the only real page; the
+	// listing does not show it until the next relist.
 	fb.onClose = func(fb *fakeBrowser) { fb.remove("real") }
-	if got := fb.sweep(t); !slices.Equal(got, []target.ID{"a"}) {
-		t.Fatalf("closed %v, want only [a]: b became the last page", got)
+	if got := fb.sweep(t, fb.candidates()); !slices.Equal(got, []target.ID{"a"}) {
+		t.Fatalf("closed %v, want only [a]: b must survive as the last page", got)
 	}
 
 	// A prerender target is not a page that keeps a window open.
 	prerender := &target.Info{TargetID: "pre", Type: "page", Subtype: "prerender", URL: "https://x.com/", BrowserContextID: testDefaultCtx}
-	fb = &fakeBrowser{targets: []*target.Info{blankTab("a"), prerender}}
-	if got := fb.sweep(t); len(got) != 0 {
-		t.Fatalf("closed %v, want none: a is the last real page", got)
+	fb = &fakeBrowser{targets: []*target.Info{blankTab("a"), blankTab("b"), prerender}}
+	if got := fb.sweep(t, fb.candidates()); len(got) != 1 {
+		t.Fatalf("closed %v, want exactly 1 of 2 blanks", got)
 	}
+}
 
-	// An all-blank browser keeps exactly one.
-	fb = &fakeBrowser{targets: []*target.Info{blankTab("a"), blankTab("b")}}
-	if got := fb.sweep(t); len(got) != 1 {
-		t.Fatalf("all-blank browser: closed %v, want exactly 1 of 2", got)
+// TestCloseStaleBlanks_ClearsLargePileWithFewListings guards the budget:
+// a pile of thousands must not cost one full listing per close.
+func TestCloseStaleBlanks_ClearsLargePileWithFewListings(t *testing.T) {
+	noClosePause(t)
+	const n = 3000
+	targets := []*target.Info{realTab("real")}
+	for i := range n {
+		targets = append(targets, blankTab(fmt.Sprintf("blank%d", i)))
+	}
+	fb := &fakeBrowser{targets: targets}
+	closed := fb.sweep(t, fb.candidates())
+	if len(closed) != n-1 {
+		t.Fatalf("closed %d of %d blanks, want %d (all but the spared last)", len(closed), n, n-1)
+	}
+	// A fixed bound, not one derived from sweepRelistEvery, so relisting
+	// before every close fails it.
+	const maxLists = 100
+	if fb.lists > maxLists {
+		t.Fatalf("%d target listings for %d closes, want at most %d", fb.lists, len(closed), maxLists)
 	}
 }
 
@@ -247,7 +287,14 @@ func TestSweepStaleBlankTabs_Live(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	stale := []target.ID{createTab(t, bctx, "about:blank"), createTab(t, bctx, "about:blank"), createTab(t, bctx, "about:blank")}
+	// Chrome's own launch tab is a stale blank too.
+	var stale []target.ID
+	for id, url := range pageTargets(t, bctx) {
+		if url == "about:blank" {
+			stale = append(stale, id)
+		}
+	}
+	stale = append(stale, createTab(t, bctx, "about:blank"), createTab(t, bctx, "about:blank"), createTab(t, bctx, "about:blank"))
 	real := createTab(t, bctx, srv.URL)
 
 	const minAge = 3 * time.Second
@@ -270,20 +317,20 @@ func TestSweepStaleBlankTabs_Live(t *testing.T) {
 	}
 	time.Sleep(500 * time.Millisecond)
 	pages := pageTargets(t, bctx)
+	survivors := 0
 	for _, id := range stale {
 		if _, ok := pages[id]; ok {
-			t.Errorf("stale about:blank tab %s survived the sweep", id)
+			survivors++
 		}
+	}
+	// The sweep spares its last candidate, so exactly one stale blank stays.
+	if survivors != 1 || res.closed != len(stale)-1 {
+		t.Errorf("closed %d, %d of %d stale blanks survived; want %d closed, 1 survivor", res.closed, survivors, len(stale), len(stale)-1)
 	}
 	if _, ok := pages[real]; !ok {
 		t.Errorf("real-URL tab %s was closed", real)
 	}
 	if _, ok := pages[fresh]; !ok {
 		t.Errorf("fresh about:blank tab %s was closed", fresh)
-	}
-	// The launch tab (about:blank) is stale too, unless it was kept as the
-	// last page; either way at least the three seeded tabs went.
-	if res.closed < len(stale) {
-		t.Errorf("closed %d tabs, want >= %d", res.closed, len(stale))
 	}
 }
