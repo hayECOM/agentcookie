@@ -139,6 +139,7 @@ func runSink(cmd *cobra.Command, args []string) error {
 		endpoint := liveCDPEndpointFor(cfg)
 		fmt.Fprintf(os.Stderr, "agentcookie sink: live_cdp enabled; will inject into running Chrome at %s\n", endpoint)
 	}
+	startLiveCDPSweep(cmd.Context(), cfg)
 	transportSecret, err := resolveTransportSecret(common.ConfigDir, cfg.Peer.Hostname, cfg.Security.SharedSecret)
 	if err != nil {
 		return err

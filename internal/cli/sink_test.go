@@ -20,6 +20,7 @@ import (
 
 	"github.com/mvanhorn/agentcookie/internal/chrome"
 	"github.com/mvanhorn/agentcookie/internal/config"
+	"github.com/mvanhorn/agentcookie/internal/livecdp"
 	"github.com/mvanhorn/agentcookie/internal/protocol"
 	"github.com/mvanhorn/agentcookie/internal/sinkpush"
 	"github.com/mvanhorn/agentcookie/internal/state"
@@ -1457,5 +1458,42 @@ func TestLiveCDPReinjectTickSuccessClearsStateError(t *testing.T) {
 	}
 	if cdp.LastCookies != 2 || cdp.LastContexts != 1 || cdp.TotalInjects != before.TotalInjects+1 {
 		t.Fatalf("counts after tick = %+v, want 2 cookies, 1 context, one more inject", cdp)
+	}
+}
+
+func TestLiveCDPSweepStartsOnlyWhenLiveCDPModifiesChrome(t *testing.T) {
+	calls := make(chan string, 1)
+	prev := liveCDPSweep
+	liveCDPSweep = func(_ context.Context, endpoint string, minAge time.Duration) (int, error) {
+		if minAge != livecdp.DefaultSweepMinAge {
+			t.Errorf("sweep minAge = %s, want %s", minAge, livecdp.DefaultSweepMinAge)
+		}
+		calls <- endpoint
+		return 0, nil
+	}
+	t.Cleanup(func() { liveCDPSweep = prev })
+
+	fx := newSinkHandlerFixture(t, false)
+	if startLiveCDPSweep(context.Background(), fx.cfg) {
+		t.Fatal("sweep started with live_cdp disabled")
+	}
+	fx.cfg.LiveCDP = config.LiveCDPRef{Enabled: true, Endpoint: "http://127.0.0.1:9333"}
+	prevDry := sinkDryRun
+	t.Cleanup(func() { sinkDryRun = prevDry })
+	sinkDryRun = true
+	if startLiveCDPSweep(context.Background(), fx.cfg) {
+		t.Fatal("sweep started in --dry-run")
+	}
+	sinkDryRun = false
+	if !startLiveCDPSweep(context.Background(), fx.cfg) {
+		t.Fatal("sweep not started with live_cdp on and --dry-run off")
+	}
+	select {
+	case got := <-calls:
+		if got != "http://127.0.0.1:9333" {
+			t.Fatalf("sweep endpoint = %q", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("sweep never ran")
 	}
 }
