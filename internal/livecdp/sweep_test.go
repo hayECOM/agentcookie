@@ -17,40 +17,120 @@ import (
 	"github.com/mvanhorn/agentcookie/internal/chrome"
 )
 
+const testDefaultCtx cdp.BrowserContextID = "defaultctx"
+
+func blankTab(id string) *target.Info {
+	return &target.Info{TargetID: target.ID(id), Type: "page", URL: "about:blank", BrowserContextID: testDefaultCtx}
+}
+
+func realTab(id string) *target.Info {
+	return &target.Info{TargetID: target.ID(id), Type: "page", URL: "https://github.com/", BrowserContextID: testDefaultCtx}
+}
+
 func TestStaleBlankTargets(t *testing.T) {
-	page := func(id, url string) *target.Info {
-		return &target.Info{TargetID: target.ID(id), Type: "page", URL: url}
-	}
-	stale1 := page("stale1", "about:blank")
-	stale2 := page("stale2", "about:blank")
-	real := page("real", "https://github.com/")
-	navigated := page("navigated", "https://example.com/")
-	fresh := page("fresh", "about:blank")
+	stale1, stale2 := blankTab("stale1"), blankTab("stale2")
+	navigated := realTab("navigated")
 	agent := &target.Info{TargetID: "agent", Type: "page", URL: "about:blank", BrowserContextID: "agentctx"}
-	prerender := &target.Info{TargetID: "pre", Type: "page", Subtype: "prerender", URL: "about:blank"}
-	worker := &target.Info{TargetID: "sw", Type: "service_worker", URL: "about:blank"}
-	ui := page("ui", "chrome://newtab-footer/")
+	// Incognito contexts are missing from Target.getBrowserContexts, so
+	// only a positive default-context match may qualify a tab.
+	incognito := &target.Info{TargetID: "incog", Type: "page", URL: "about:blank", BrowserContextID: "incognitoctx"}
+	prerender := &target.Info{TargetID: "pre", Type: "page", Subtype: "prerender", URL: "about:blank", BrowserContextID: testDefaultCtx}
+	worker := &target.Info{TargetID: "sw", Type: "service_worker", URL: "about:blank", BrowserContextID: testDefaultCtx}
 
-	first := []*target.Info{stale1, stale2, real, page("navigated", "about:blank"), agent, prerender, worker, ui, nil}
-	second := []*target.Info{stale1, stale2, real, navigated, fresh, agent, prerender, worker, ui, nil}
-	explicit := map[cdp.BrowserContextID]bool{"agentctx": true}
+	first := []*target.Info{stale1, stale2, realTab("real"), blankTab("navigated"), agent, incognito, prerender, worker, nil}
+	second := []*target.Info{stale1, stale2, realTab("real"), navigated, blankTab("fresh"), agent, incognito, prerender, worker, nil}
 
-	got := staleBlankTargets(first, second, explicit)
+	var got []target.ID
+	for _, info := range staleBlankTargets(first, second, testDefaultCtx) {
+		got = append(got, info.TargetID)
+	}
 	want := []target.ID{"stale1", "stale2"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("staleBlankTargets = %v, want %v", got, want)
 	}
 }
 
-func TestStaleBlankTargets_KeepsLastPage(t *testing.T) {
-	a := &target.Info{TargetID: "a", Type: "page", URL: "about:blank"}
-	b := &target.Info{TargetID: "b", Type: "page", URL: "about:blank"}
-	listing := []*target.Info{a, b}
-	if got := staleBlankTargets(listing, listing, nil); len(got) != 1 {
-		t.Fatalf("all-blank browser: closing %v, want exactly 1 of 2 so a page stays open", got)
+// fakeBrowser is a target list the close loop reads and closes from;
+// onClose lets a test change the browser between closes, as another
+// client would.
+type fakeBrowser struct {
+	targets []*target.Info
+	closed  []target.ID
+	onClose func(fb *fakeBrowser)
+}
+
+func (fb *fakeBrowser) list() ([]*target.Info, error) {
+	out := make([]*target.Info, 0, len(fb.targets))
+	for _, info := range fb.targets {
+		c := *info
+		out = append(out, &c)
 	}
-	if got := staleBlankTargets([]*target.Info{a}, []*target.Info{a}, nil); len(got) != 0 {
-		t.Fatalf("single blank page: closing %v, want none", got)
+	return out, nil
+}
+
+func (fb *fakeBrowser) close(id target.ID) error {
+	fb.closed = append(fb.closed, id)
+	fb.remove(id)
+	if fb.onClose != nil {
+		fb.onClose(fb)
+	}
+	return nil
+}
+
+func (fb *fakeBrowser) remove(id target.ID) {
+	fb.targets = slices.DeleteFunc(fb.targets, func(info *target.Info) bool { return info.TargetID == id })
+}
+
+func (fb *fakeBrowser) find(id target.ID) *target.Info {
+	return findTarget(fb.targets, id)
+}
+
+func (fb *fakeBrowser) sweep(t *testing.T) []target.ID {
+	t.Helper()
+	candidates, _ := fb.list()
+	candidates = slices.DeleteFunc(candidates, func(info *target.Info) bool { return !isSweepableBlank(info, testDefaultCtx) })
+	if _, err := closeStaleBlanks(candidates, fb.list, fb.close, testDefaultCtx); err != nil {
+		t.Fatal(err)
+	}
+	return fb.closed
+}
+
+func TestCloseStaleBlanks_RevalidatesEachCandidate(t *testing.T) {
+	fb := &fakeBrowser{targets: []*target.Info{blankTab("a"), blankTab("b"), blankTab("c"), realTab("real")}}
+	// While a closes, another client navigates b and attaches to c.
+	fb.onClose = func(fb *fakeBrowser) {
+		if b := fb.find("b"); b != nil {
+			b.URL = "https://example.com/"
+		}
+		if c := fb.find("c"); c != nil {
+			c.Attached = true
+		}
+		fb.onClose = nil
+	}
+	if got := fb.sweep(t); !slices.Equal(got, []target.ID{"a"}) {
+		t.Fatalf("closed %v, want only [a]: b was navigated and c claimed after sampling", got)
+	}
+}
+
+func TestCloseStaleBlanks_KeepsLastLivePage(t *testing.T) {
+	fb := &fakeBrowser{targets: []*target.Info{blankTab("a"), blankTab("b"), realTab("real")}}
+	// After a closes, another client closes the only real page.
+	fb.onClose = func(fb *fakeBrowser) { fb.remove("real") }
+	if got := fb.sweep(t); !slices.Equal(got, []target.ID{"a"}) {
+		t.Fatalf("closed %v, want only [a]: b became the last page", got)
+	}
+
+	// A prerender target is not a page that keeps a window open.
+	prerender := &target.Info{TargetID: "pre", Type: "page", Subtype: "prerender", URL: "https://x.com/", BrowserContextID: testDefaultCtx}
+	fb = &fakeBrowser{targets: []*target.Info{blankTab("a"), prerender}}
+	if got := fb.sweep(t); len(got) != 0 {
+		t.Fatalf("closed %v, want none: a is the last real page", got)
+	}
+
+	// An all-blank browser keeps exactly one.
+	fb = &fakeBrowser{targets: []*target.Info{blankTab("a"), blankTab("b")}}
+	if got := fb.sweep(t); len(got) != 1 {
+		t.Fatalf("all-blank browser: closed %v, want exactly 1 of 2", got)
 	}
 }
 

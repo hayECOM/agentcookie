@@ -18,12 +18,13 @@ const DefaultSweepMinAge = 60 * time.Second
 // SweepStaleBlankTabs closes the about:blank tabs left in the Chrome at
 // endpoint by earlier attach-and-inject runs, which leaked one tab per
 // inject. CDP reports no target creation time, so age is observed: it lists
-// the targets, waits minAge, lists again, and closes only page targets that
-// were about:blank both times. It never closes a page with a real URL, a
-// non-page target (service worker, extension, browser UI), a tab in an
-// explicit browser context (an agent's own context), or the last page
-// target, which on Linux would quit the browser. It returns the number of
-// tabs closed.
+// the targets, waits minAge, lists again, and picks page targets that were
+// about:blank both times. Each pick is checked again against a fresh listing
+// right before it is closed. It never closes a page with a real URL, a
+// non-page target (service worker, extension, browser UI), a tab outside the
+// default browser context (an agent's own context, incognito), or the last
+// page, which on Linux would quit the browser. It returns the number of tabs
+// closed.
 func SweepStaleBlankTabs(ctx context.Context, endpoint string, minAge time.Duration) (int, error) {
 	if endpoint == "" {
 		endpoint = DefaultCDPEndpoint
@@ -49,23 +50,70 @@ func SweepStaleBlankTabs(ctx context.Context, endpoint string, minAge time.Durat
 	if err != nil {
 		return 0, fmt.Errorf("livecdp: sweep: list targets: %w", err)
 	}
-	explicit, err := explicitContextSet(browserCtx)
-	if err != nil {
-		// Without the set, a blank tab in an agent's own context cannot
-		// be told apart, so close nothing.
-		return 0, fmt.Errorf("livecdp: sweep: list browser contexts: %w", err)
-	}
 
 	bctx, err := browserExecutor(browserCtx)
 	if err != nil {
 		return 0, err
 	}
+	// The default context is identified by id, not by absence from the
+	// explicit list: incognito contexts are in neither.
+	_, defaultID, err := target.GetBrowserContexts().Do(bctx)
+	if err != nil {
+		return 0, fmt.Errorf("livecdp: sweep: list browser contexts: %w", err)
+	}
+	if defaultID == "" {
+		// This Chrome does not report its default context, so no blank
+		// tab can be placed safely; close nothing.
+		return 0, nil
+	}
+
+	list := func() ([]*target.Info, error) { return chromedp.Targets(browserCtx) }
+	closeTarget := func(id target.ID) error { return target.CloseTarget(id).Do(bctx) }
+	return closeStaleBlanks(staleBlankTargets(first, second, defaultID), list, closeTarget, defaultID)
+}
+
+// staleBlankTargets picks the sweep candidates from two listings taken at
+// least minAge apart: blank tabs in the default context that were already
+// blank in the first listing. It returns each candidate's info from the
+// second listing, so a later change can be seen.
+func staleBlankTargets(first, second []*target.Info, defaultID cdp.BrowserContextID) []*target.Info {
+	wasBlank := map[target.ID]bool{}
+	for _, info := range first {
+		if isSweepableBlank(info, defaultID) {
+			wasBlank[info.TargetID] = true
+		}
+	}
+	var stale []*target.Info
+	for _, info := range second {
+		if isSweepableBlank(info, defaultID) && wasBlank[info.TargetID] {
+			stale = append(stale, info)
+		}
+	}
+	return stale
+}
+
+// closeStaleBlanks closes the candidates one at a time. Before each close it
+// lists the targets again and skips a candidate that is gone, is no longer a
+// blank default-context tab, or has been attached to since it was sampled.
+// It stops once only one page would remain.
+func closeStaleBlanks(candidates []*target.Info, list func() ([]*target.Info, error), closeTarget func(target.ID) error, defaultID cdp.BrowserContextID) (int, error) {
 	closed := 0
 	var firstErr error
-	for _, id := range staleBlankTargets(first, second, explicit) {
-		if err := target.CloseTarget(id).Do(bctx); err != nil {
+	for _, sampled := range candidates {
+		live, err := list()
+		if err != nil {
+			return closed, fmt.Errorf("livecdp: sweep: list targets: %w", err)
+		}
+		if livePages(live) <= 1 {
+			break
+		}
+		cur := findTarget(live, sampled.TargetID)
+		if !isSweepableBlank(cur, defaultID) || (cur.Attached && !sampled.Attached) {
+			continue
+		}
+		if err := closeTarget(cur.TargetID); err != nil {
 			if firstErr == nil {
-				firstErr = fmt.Errorf("livecdp: sweep: close target %s: %w", id, err)
+				firstErr = fmt.Errorf("livecdp: sweep: close target %s: %w", cur.TargetID, err)
 			}
 			continue
 		}
@@ -74,37 +122,30 @@ func SweepStaleBlankTabs(ctx context.Context, endpoint string, minAge time.Durat
 	return closed, firstErr
 }
 
-// staleBlankTargets picks the targets SweepStaleBlankTabs closes from two
-// listings taken at least minAge apart: blank tabs in the default context
-// that were already blank in the first listing. It keeps at least one page
-// target open.
-func staleBlankTargets(first, second []*target.Info, explicit map[cdp.BrowserContextID]bool) []target.ID {
-	wasBlank := map[target.ID]bool{}
-	for _, info := range first {
-		if isSweepableBlank(info, explicit) {
-			wasBlank[info.TargetID] = true
+// livePages counts the page targets a user could see; a prerender target is
+// not one, so it does not keep the browser's last window open.
+func livePages(infos []*target.Info) int {
+	n := 0
+	for _, info := range infos {
+		if info != nil && info.Type == "page" && info.Subtype != "prerender" {
+			n++
 		}
 	}
-	pages := 0
-	var stale []target.ID
-	for _, info := range second {
-		if info == nil || info.Type != "page" {
-			continue
-		}
-		pages++
-		if isSweepableBlank(info, explicit) && wasBlank[info.TargetID] {
-			stale = append(stale, info.TargetID)
+	return n
+}
+
+func findTarget(infos []*target.Info, id target.ID) *target.Info {
+	for _, info := range infos {
+		if info != nil && info.TargetID == id {
+			return info
 		}
 	}
-	if len(stale) > 0 && len(stale) == pages {
-		stale = stale[1:]
-	}
-	return stale
+	return nil
 }
 
 // isSweepableBlank reports whether info is a plain about:blank tab in the
 // default browser context.
-func isSweepableBlank(info *target.Info, explicit map[cdp.BrowserContextID]bool) bool {
+func isSweepableBlank(info *target.Info, defaultID cdp.BrowserContextID) bool {
 	return info != nil && info.Type == "page" && info.Subtype == "" &&
-		info.URL == "about:blank" && !explicit[info.BrowserContextID]
+		info.URL == "about:blank" && info.BrowserContextID == defaultID
 }
