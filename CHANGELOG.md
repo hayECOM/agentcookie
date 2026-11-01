@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Live CDP sinks stop leaving a blank tab per inject
+
+- Each live CDP inject opened an `about:blank` tab in the attached Chrome and relied on chromedp closing it when the connection was cancelled, with a one-second budget. A loaded browser missed that budget, so a sink re-injecting every 30 seconds left a tab behind nearly every time: one Mac sink's shared Chrome built up thousands of blank tabs and about 2.6 GB of memory in 2.3 days. Injection now talks only to the browser session (`Target.getTargets`, `Target.getBrowserContexts`, `Storage.setCookies`) and creates no tab at all.
+- On start, a sink with `live_cdp` on sweeps the tabs earlier versions left. It lists the browser's targets, waits 60 seconds, lists again, and closes page tabs that were `about:blank` both times. It never closes a page with a real URL, a tab another client opened in the last 60 seconds, a tab in an agent's own browser context, a service worker, extension, or browser UI target, or the browser's last page. The sweep is skipped with `--dry-run` and logs a line only when it closed something or failed.
+
 ### Dia source-browser support
 
 Dia (The Browser Company) is a Chromium-family source adapter using the same Safe Storage model as Arc, Brave, and Edge. Set `browser.name: dia` in `source.yaml`. Discovery labels Dia's `User Data` root as `dia` so key lookup uses `Dia Safe Storage` rather than Chrome's.

@@ -14,9 +14,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/mvanhorn/agentcookie/internal/chrome"
 	"github.com/mvanhorn/agentcookie/internal/config"
+	"github.com/mvanhorn/agentcookie/internal/livecdp"
 	"github.com/mvanhorn/agentcookie/internal/protocol"
 	"github.com/mvanhorn/agentcookie/internal/state"
 	"github.com/mvanhorn/agentcookie/internal/transport"
@@ -788,5 +790,42 @@ func TestMaybeRebindListenAddr_ParseError(t *testing.T) {
 	got := maybeRebindListenAddr(context.Background(), addr)
 	if got != addr {
 		t.Errorf("unparseable address should pass through unchanged: got %q, want %q", got, addr)
+	}
+}
+
+func TestLiveCDPSweepStartsOnlyWhenLiveCDPModifiesChrome(t *testing.T) {
+	calls := make(chan string, 1)
+	prev := liveCDPSweep
+	liveCDPSweep = func(_ context.Context, endpoint string, minAge time.Duration) (int, error) {
+		if minAge != livecdp.DefaultSweepMinAge {
+			t.Errorf("sweep minAge = %s, want %s", minAge, livecdp.DefaultSweepMinAge)
+		}
+		calls <- endpoint
+		return 0, nil
+	}
+	t.Cleanup(func() { liveCDPSweep = prev })
+
+	cfg := &config.SinkConfig{}
+	if startLiveCDPSweep(context.Background(), cfg) {
+		t.Fatal("sweep started with live_cdp disabled")
+	}
+	cfg.LiveCDP = config.LiveCDPRef{Enabled: true, Endpoint: "http://127.0.0.1:9333"}
+	prevDry := sinkDryRun
+	t.Cleanup(func() { sinkDryRun = prevDry })
+	sinkDryRun = true
+	if startLiveCDPSweep(context.Background(), cfg) {
+		t.Fatal("sweep started in --dry-run")
+	}
+	sinkDryRun = false
+	if !startLiveCDPSweep(context.Background(), cfg) {
+		t.Fatal("sweep not started with live_cdp on and --dry-run off")
+	}
+	select {
+	case got := <-calls:
+		if got != "http://127.0.0.1:9333" {
+			t.Fatalf("sweep endpoint = %q", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("sweep never ran")
 	}
 }
