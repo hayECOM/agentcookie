@@ -191,24 +191,42 @@ surface that was not open before its Push. Guards:
 `TestCmuxPush_StaleCacheReusesAnotherSurface`,
 `TestCmuxPush_NoBrowserSurfaceAddsOne`.
 
-### Byte-bounded batches, and dead restored shells (2026-11-02)
+### Small frames, retries, delta push, and dead restored shells (2026-11-02)
 
-cmux 0.65.2 drops the client connection on an rpc frame somewhere between
-~326KB and ~633KB (likely 512KB). The adapter chunked by **count** (200), real
-Chrome cookies serialize past the cap, and every chunk failed `Broken pipe`
--- cmux delivery was dead from the upgrade until this fix. `cmuxChunks` now
-bounds each `browser.cookies.set` params JSON at `cmuxMaxParamsBytes`
-(250KB; the 200-count cap stays as a secondary bound). A cookie too big for
-any frame is skipped with a stderr line (name + host only), never looped.
+cmux 0.65.2's socket drops request frames bigger than **~4KB** at random
+("Socket closed before reply" / "Broken pipe"), and a dropped call lands
+nothing. Measured with the sink stopped: params up to 3818 bytes failed 0 of
+75 calls; from ~3900 bytes up, 15-65% failed at every size up to 334KB, no
+matter the cookie count. (The first diagnosis, a ~512KB cap, came from too
+few samples.) 200-cookie batches are ~60-80KB, so cmux delivery was dead
+from the upgrade until this fix. Now:
+
+- `cmuxChunks` bounds each `browser.cookies.set` params JSON at
+  `cmuxMaxParamsBytes` (3500). A cookie bigger than that rides alone.
+- `setCookiesLocked` resends a dropped frame up to `cmuxTransientRetries`
+  times (`isTransientSocketError`). Broken pipe is **not** "cmux down" any
+  more; a chunk that drops through every retry is left unrecorded, the push
+  carries on, and Push returns a `N of M cookies not delivered` error.
+- **Delta push.** A full push is now ~300 calls (~19ms each) inside the
+  `/sync` handler, so the adapter fingerprints (sha256, no values held) what
+  landed and resends only changed cookies. The record resets on a surface
+  change and every `cmuxFullResync` (15 min). WebKit rejects are recorded
+  too, so an unchanged reject is not re-sent each push. Side effect: a
+  cookie the cmux browser rotated itself is no longer clobbered by the
+  laptop's copy every 30s, only on the 15-min resync or a source change.
 
 cmux session-restore resurrects browser tabs as uninitialized shells: `tree`
 lists them as `browser` with an empty url -- exactly what reuse prefers --
 but every `browser.*` rpc fails `Surface is not a browser`. Reuse now probes
 each candidate with the read-only `browser.url.get` and skips only those
 that fail with a surface error; any other probe failure counts as alive, so
-an older cmux never degrades into a tab per push. Guards:
-`TestCmuxPush_RealisticSetStaysUnderFrameCap`, `TestCmuxChunks_*`,
-`TestCmuxPush_SkipsDeadRestoredShells`, `TestCmuxPush_ProbeNonSurfaceErrorStillReuses`.
+an older cmux never degrades into a tab per push.
+
+Guards: `TestCmuxPush_RealisticSetStaysUnderFrameCap`, `TestCmuxChunks_*`,
+`TestCmuxPush_RetriesDroppedFrame`,
+`TestCmuxPush_PersistentDropSkipsChunkKeepsGoingAndResends`,
+`TestCmuxPush_Delta*`, `TestCmuxPush_SkipsDeadRestoredShells`,
+`TestCmuxPush_ProbeNonSurfaceErrorStillReuses`.
 
 Caveat: cmux exposes no per-surface browser profile in `tree`. If a
 non-default `--profile` browser tab is ever the only one open, cookies would
