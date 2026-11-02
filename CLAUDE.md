@@ -191,6 +191,25 @@ surface that was not open before its Push. Guards:
 `TestCmuxPush_StaleCacheReusesAnotherSurface`,
 `TestCmuxPush_NoBrowserSurfaceAddsOne`.
 
+### Byte-bounded batches, and dead restored shells (2026-11-02)
+
+cmux 0.65.2 drops the client connection on an rpc frame somewhere between
+~326KB and ~633KB (likely 512KB). The adapter chunked by **count** (200), real
+Chrome cookies serialize past the cap, and every chunk failed `Broken pipe`
+-- cmux delivery was dead from the upgrade until this fix. `cmuxChunks` now
+bounds each `browser.cookies.set` params JSON at `cmuxMaxParamsBytes`
+(250KB; the 200-count cap stays as a secondary bound). A cookie too big for
+any frame is skipped with a stderr line (name + host only), never looped.
+
+cmux session-restore resurrects browser tabs as uninitialized shells: `tree`
+lists them as `browser` with an empty url -- exactly what reuse prefers --
+but every `browser.*` rpc fails `Surface is not a browser`. Reuse now probes
+each candidate with the read-only `browser.url.get` and skips only those
+that fail with a surface error; any other probe failure counts as alive, so
+an older cmux never degrades into a tab per push. Guards:
+`TestCmuxPush_RealisticSetStaysUnderFrameCap`, `TestCmuxChunks_*`,
+`TestCmuxPush_SkipsDeadRestoredShells`, `TestCmuxPush_ProbeNonSurfaceErrorStillReuses`.
+
 Caveat: cmux exposes no per-surface browser profile in `tree`. If a
 non-default `--profile` browser tab is ever the only one open, cookies would
 land in that profile's store.

@@ -53,7 +53,8 @@ var surfaceRefRE = regexp.MustCompile(`surface:\d+`)
 // the first workspace's active pane.
 //
 // A reused surface may be a live user or agent page (a dashboard, a
-// logged-in session). The adapter only ever calls browser.cookies.set
+// logged-in session). The adapter only ever calls browser.cookies.set (and
+// the read-only browser.url.get liveness probe, see surfaceAliveLocked)
 // against it -- never navigate, reload, focus or close. The auth probe in
 // verify.go, which must navigate, opens and closes its own surface.
 //
@@ -169,12 +170,20 @@ func (a *CmuxAdapter) Push(cookies []chrome.Cookie) error {
 
 	// Inject in batches: browser.cookies.set accepts a cookies array, so a
 	// full Chrome cookie set lands in a handful of RPC calls instead of one
-	// per cookie. Chunked because the JSON params ride a CLI arg bounded by
-	// ARG_MAX (~1MB); cmuxCookieBatch keeps each call well under that.
+	// per cookie. Chunked by serialized size (see cmuxMaxParamsBytes): cmux
+	// 0.65 drops the connection on an oversized frame, which a count-only
+	// cap of real Chrome cookies routinely tripped.
+	chunks, oversized := cmuxChunks(a.surfaceID, cookies, cmuxMaxParamsBytes)
+	for _, c := range oversized {
+		// Cannot ride any frame cmux will accept; skip it loudly rather than
+		// fail every push. Name and host only -- never the value.
+		fmt.Fprintf(os.Stderr, "agentcookie: cmux: skipped cookie %q for %s: params exceed %d bytes\n", c.Name, c.HostKey, cmuxMaxParamsBytes)
+	}
 	reopened := false
-	for start := 0; start < len(cookies); start += cmuxCookieBatch {
-		end := min(start+cmuxCookieBatch, len(cookies))
-		chunk := cookies[start:end]
+	end := 0
+	for _, chunk := range chunks {
+		start := end
+		end += len(chunk)
 		err := a.setCookiesLocked(chunk)
 		if err == nil {
 			continue
@@ -201,7 +210,7 @@ func (a *CmuxAdapter) Push(cookies []chrome.Cookie) error {
 		// the one reopen attempt -- a reopen that didn't fix it won't be fixed
 		// per-cookie either, and silently skipping would lose the whole chunk.
 		if isCmuxUnavailable(err) || isSurfaceError(err) {
-			return fmt.Errorf("cmux: set cookies [%d:%d] of %d: %w", start, end, len(cookies), err)
+			return fmt.Errorf("cmux: set cookies [%d:%d] of %d: %w", start, end, len(cookies)-len(oversized), err)
 		}
 		// Otherwise one cookie in the chunk is rejected by cmux (e.g. a
 		// payload WebKit won't accept). Fall back to per-cookie so the rest
@@ -221,10 +230,12 @@ func (a *CmuxAdapter) Push(cookies []chrome.Cookie) error {
 
 // ensureSurfaceLocked returns the cached injection surface ref. With no
 // cache it first reuses a browser surface that is already open anywhere in
-// cmux (see reusableBrowserSurface), and only when there is none adds an
+// cmux and passes a liveness probe (see reusableBrowserSurfaces and
+// surfaceAliveLocked), and only when there is none adds an
 // unfocused about:blank browser tab to an existing workspace. avoid is a
 // surface ref that must not be picked (the one that just failed); "" for
-// none. A reused surface is only ever the target of browser.cookies.set --
+// none. A reused surface is only ever probed with the read-only
+// browser.url.get and then the target of browser.cookies.set --
 // nothing here navigates, focuses or closes it.
 // Caller must hold a.mu.
 func (a *CmuxAdapter) ensureSurfaceLocked(avoid string) (string, error) {
@@ -239,9 +250,15 @@ func (a *CmuxAdapter) ensureSurfaceLocked(avoid string) (string, error) {
 	// unparseable output) falls through to adding a tab: one stray tab
 	// beats no delivery.
 	if err == nil {
-		if sid := reusableBrowserSurface(treeOut, avoid); sid != "" {
-			a.surfaceID = sid
-			return sid, nil
+		for _, sid := range reusableBrowserSurfaces(treeOut, avoid) {
+			alive, perr := a.surfaceAliveLocked(sid)
+			if perr != nil {
+				return "", perr
+			}
+			if alive {
+				a.surfaceID = sid
+				return sid, nil
+			}
 		}
 	}
 	ws, err := a.hostWorkspaceLocked()
@@ -263,12 +280,36 @@ func (a *CmuxAdapter) ensureSurfaceLocked(avoid string) (string, error) {
 	return sid, nil
 }
 
-// reusableBrowserSurface picks an already-open browser surface from `cmux
-// tree --all --json` output: the first about:blank one (empty url, as cmux
-// reports a fresh tab) if any, else the first browser surface of any kind.
-// avoid is skipped. Returns "" when there is none or the JSON is
-// unparseable.
-func reusableBrowserSurface(treeJSON, avoid string) string {
+// surfaceAliveLocked probes a reuse candidate with a read-only
+// browser.url.get. cmux session-restore resurrects browser tabs as
+// uninitialized shells: `tree` lists them as type browser with an empty
+// url -- exactly what reuse prefers -- but every browser.* rpc against
+// them fails "Surface is not a browser". Only a surface error marks the
+// candidate dead; cmux being unreachable is returned as an error, and any
+// other failure (say, a cmux without browser.url.get) counts as alive so
+// it never pushes the adapter into adding a tab per push.
+// Caller must hold a.mu.
+func (a *CmuxAdapter) surfaceAliveLocked(sid string) (bool, error) {
+	params, _ := json.Marshal(map[string]string{"surface_id": sid})
+	_, err := a.run("rpc", "browser.url.get", string(params))
+	switch {
+	case err == nil:
+		return true, nil
+	case isCmuxUnavailable(err):
+		return false, err
+	case isSurfaceError(err):
+		return false, nil
+	default:
+		return true, nil
+	}
+}
+
+// reusableBrowserSurfaces lists the already-open browser surfaces in `cmux
+// tree --all --json` output, in reuse preference order: about:blank ones
+// (empty url, as cmux reports a fresh tab) first, then every other
+// browser surface. avoid is skipped. Returns nil when there is none or the
+// JSON is unparseable.
+func reusableBrowserSurfaces(treeJSON, avoid string) []string {
 	var parsed struct {
 		Windows []struct {
 			Workspaces []struct {
@@ -283,9 +324,9 @@ func reusableBrowserSurface(treeJSON, avoid string) string {
 		} `json:"windows"`
 	}
 	if err := json.Unmarshal([]byte(treeJSON), &parsed); err != nil {
-		return ""
+		return nil
 	}
-	var blank, first string
+	var blank, live []string
 	for _, w := range parsed.Windows {
 		for _, ws := range w.Workspaces {
 			for _, p := range ws.Panes {
@@ -293,20 +334,16 @@ func reusableBrowserSurface(treeJSON, avoid string) string {
 					if sf.Type != "browser" || sf.Ref == "" || sf.Ref == avoid {
 						continue
 					}
-					if first == "" {
-						first = sf.Ref
-					}
-					if blank == "" && (sf.URL == nil || *sf.URL == "" || *sf.URL == "about:blank") {
-						blank = sf.Ref
+					if sf.URL == nil || *sf.URL == "" || *sf.URL == "about:blank" {
+						blank = append(blank, sf.Ref)
+					} else {
+						live = append(live, sf.Ref)
 					}
 				}
 			}
 		}
 	}
-	if blank != "" {
-		return blank
-	}
-	return first
+	return append(blank, live...)
 }
 
 // hostWorkspaceLocked returns a workspace to host an added injection tab
@@ -350,10 +387,49 @@ func firstWorkspaceRef(listJSON string) string {
 }
 
 // cmuxCookieBatch caps how many cookies ride one browser.cookies.set
-// call. The params travel as a CLI arg bounded by ARG_MAX (~1MB on
-// macOS); at a few hundred bytes per cookie, 200 keeps each call well
-// under that with comfortable headroom.
+// call. It is a secondary cap; cmuxMaxParamsBytes is the one that bites.
 const cmuxCookieBatch = 200
+
+// cmuxMaxParamsBytes bounds one browser.cookies.set params JSON. cmux
+// 0.65.2 drops the client connection on a socket frame somewhere between
+// ~326KB (accepted) and ~633KB (EPIPE), likely a 512KB cap, and 200 real
+// Chrome cookies routinely serialize past it -- every chunk then failed
+// with "Broken pipe" and no cookie landed. 250KB stays well under both
+// that cap and ARG_MAX (~1MB; the params ride a single CLI arg).
+const cmuxMaxParamsBytes = 250_000
+
+// cmuxChunks splits cookies into browser.cookies.set batches whose params
+// JSON (as cmuxCookiesJSON builds it for surfaceID) is at most maxBytes and
+// at most cmuxCookieBatch cookies. A cookie that cannot fit even alone is
+// returned in oversized rather than sent: it would fail every push.
+func cmuxChunks(surfaceID string, cookies []chrome.Cookie, maxBytes int) (chunks [][]chrome.Cookie, oversized []chrome.Cookie) {
+	// The params are {"cookies":[p1,p2,...],"surface_id":"..."}, so a
+	// chunk's size is the empty envelope plus each param plus the commas.
+	envelope, _ := cmuxCookiesJSON(surfaceID, nil)
+	var chunk []chrome.Cookie
+	size := len(envelope)
+	for _, c := range cookies {
+		b, err := json.Marshal(cmuxCookieParam(c))
+		if err != nil || len(envelope)+len(b) > maxBytes {
+			oversized = append(oversized, c)
+			continue
+		}
+		add := len(b)
+		if len(chunk) > 0 {
+			add++ // comma
+		}
+		if len(chunk) > 0 && (size+add > maxBytes || len(chunk) >= cmuxCookieBatch) {
+			chunks = append(chunks, chunk)
+			chunk, size, add = nil, len(envelope), len(b)
+		}
+		chunk = append(chunk, c)
+		size += add
+	}
+	if len(chunk) > 0 {
+		chunks = append(chunks, chunk)
+	}
+	return chunks, oversized
+}
 
 // setCookiesLocked sends a batch of cookies to the cached surface in one
 // browser.cookies.set call. Caller must hold a.mu and have a non-empty

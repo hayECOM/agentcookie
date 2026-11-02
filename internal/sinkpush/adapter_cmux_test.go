@@ -26,6 +26,9 @@ type fakeCmux struct {
 	treeIdx  int
 	setErrs  []error // consumed in order, one per browser.cookies.set call
 	setCalls int
+	setSizes []int // params JSON length of each browser.cookies.set call
+
+	deadSurfaces map[string]error // browser.url.get probe error per surface ref (nil = alive)
 
 	// Auth-verify (verify.go) scripting.
 	evalOuts   []string // browser.eval responses, consumed in order; last repeats
@@ -74,10 +77,23 @@ func (f *fakeCmux) run(args ...string) (string, error) {
 	if len(args) >= 2 && args[0] == "rpc" && args[1] == "browser.cookies.set" {
 		i := f.setCalls
 		f.setCalls++
+		if len(args) >= 3 {
+			f.setSizes = append(f.setSizes, len(args[2]))
+		}
 		if i < len(f.setErrs) && f.setErrs[i] != nil {
 			return "", f.setErrs[i]
 		}
 		return `{"set":1}`, nil
+	}
+	if len(args) >= 3 && args[0] == "rpc" && args[1] == "browser.url.get" {
+		var p struct {
+			SurfaceID string `json:"surface_id"`
+		}
+		_ = json.Unmarshal([]byte(args[2]), &p)
+		if e := f.deadSurfaces[p.SurfaceID]; e != nil {
+			return "", e
+		}
+		return `{"url":"about:blank"}`, nil
 	}
 	if len(args) >= 2 && args[0] == "rpc" && args[1] == "browser.eval" {
 		i := f.evalIdx
@@ -727,7 +743,8 @@ func cmuxTree(workspaces ...[]string) string {
 
 // assertOnlyCookieSetsOn fails if any call other than tree/workspace-list
 // discovery touched sid -- a reused tab may be a live page, so it must only
-// ever receive browser.cookies.set (never navigate/focus/close/reload).
+// ever receive the read-only browser.url.get liveness probe and
+// browser.cookies.set (never navigate/focus/close/reload).
 func assertOnlyCookieSetsOn(t *testing.T, calls [][]string, sid string) {
 	t.Helper()
 	for _, c := range calls {
@@ -740,7 +757,7 @@ func assertOnlyCookieSetsOn(t *testing.T, calls [][]string, sid string) {
 		if !touches {
 			continue
 		}
-		if len(c) >= 2 && c[0] == "rpc" && c[1] == "browser.cookies.set" {
+		if len(c) >= 2 && c[0] == "rpc" && (c[1] == "browser.cookies.set" || c[1] == "browser.url.get") {
 			continue
 		}
 		t.Errorf("reused surface %s got a non-cookie call: %v", sid, c)
@@ -786,7 +803,7 @@ func TestCmuxPush_ReusesLivePageWhenNoBlankTab(t *testing.T) {
 	}
 	assertOnlyCookieSetsOn(t, f.calls, "surface:40")
 	for _, c := range f.calls {
-		if len(c) >= 2 && c[0] == "rpc" && c[1] != "browser.cookies.set" {
+		if len(c) >= 2 && c[0] == "rpc" && c[1] != "browser.cookies.set" && c[1] != "browser.url.get" {
 			t.Errorf("unexpected rpc against cmux: %v", c)
 		}
 	}
@@ -854,5 +871,220 @@ func TestCmuxPush_TreeUnparseableFallsBackToAdd(t *testing.T) {
 	}
 	if countAdds(f.calls) != 1 {
 		t.Errorf("expected a fallback add, got %v", f.calls)
+	}
+}
+
+// bigCookie returns a cookie whose params serialize to roughly size bytes.
+func bigCookie(name string, size int) chrome.Cookie {
+	return chrome.Cookie{HostKey: ".github.com", Name: name, Value: strings.Repeat("v", size)}
+}
+
+func TestCmuxChunks_BoundsBytesExactly(t *testing.T) {
+	// Every chunk's real params JSON must fit the bound, and chunks must be
+	// packed (the next cookie would not have fit), so a size cap -- not the
+	// count cap -- decides the boundaries for fat cookies.
+	cookies := make([]chrome.Cookie, 50)
+	for i := range cookies {
+		cookies[i] = bigCookie("c", 3000)
+	}
+	const sid = "surface:1000010055"
+	const max = 20_000
+	chunks, oversized := cmuxChunks(sid, cookies, max)
+	if len(oversized) != 0 {
+		t.Fatalf("no cookie is oversized, got %d", len(oversized))
+	}
+	total := 0
+	for i, ch := range chunks {
+		total += len(ch)
+		p, err := cmuxCookiesJSON(sid, ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(p) > max {
+			t.Errorf("chunk %d params %d bytes > bound %d", i, len(p), max)
+		}
+		if i < len(chunks)-1 {
+			next, _ := cmuxCookiesJSON(sid, append(append([]chrome.Cookie{}, ch...), chunks[i+1][0]))
+			if len(next) <= max {
+				t.Errorf("chunk %d not packed: adding the next cookie still fits (%d <= %d)", i, len(next), max)
+			}
+		}
+	}
+	if total != len(cookies) {
+		t.Errorf("chunks carry %d cookies, want %d", total, len(cookies))
+	}
+	if len(chunks) < 2 {
+		t.Errorf("expected multiple chunks, got %d", len(chunks))
+	}
+}
+
+func TestCmuxChunks_CountCapStillApplies(t *testing.T) {
+	cookies := make([]chrome.Cookie, cmuxCookieBatch+1)
+	for i := range cookies {
+		cookies[i] = chrome.Cookie{HostKey: ".x.com", Name: "c", Value: "v"}
+	}
+	chunks, _ := cmuxChunks("surface:1", cookies, cmuxMaxParamsBytes)
+	if len(chunks) != 2 || len(chunks[0]) != cmuxCookieBatch {
+		t.Errorf("want [%d 1], got %d chunks", cmuxCookieBatch, len(chunks))
+	}
+}
+
+func TestCmuxChunks_OversizedCookieSkippedNotLooped(t *testing.T) {
+	cookies := []chrome.Cookie{
+		bigCookie("small1", 10),
+		bigCookie("giant", 5000),
+		bigCookie("small2", 10),
+	}
+	chunks, oversized := cmuxChunks("surface:1", cookies, 2000)
+	if len(oversized) != 1 || oversized[0].Name != "giant" {
+		t.Fatalf("want giant oversized, got %+v", oversized)
+	}
+	if len(chunks) != 1 || len(chunks[0]) != 2 {
+		t.Fatalf("want one chunk of the two small cookies, got %d chunks", len(chunks))
+	}
+}
+
+func TestCmuxPush_RealisticSetStaysUnderFrameCap(t *testing.T) {
+	// The regression: 200 real-sized Chrome cookies serialized past cmux
+	// 0.65's ~512KB frame cap, so every chunk broke the pipe. Each call must
+	// now stay within cmuxMaxParamsBytes, and every cookie must still land.
+	f := &fakeCmux{}
+	a := newTestCmux(f, nil)
+	cookies := make([]chrome.Cookie, 2916)
+	for i := range cookies {
+		cookies[i] = bigCookie("c", 2500)
+	}
+	if err := a.Push(cookies); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	for i, n := range f.setSizes {
+		if n > cmuxMaxParamsBytes {
+			t.Errorf("set call %d carried %d bytes > %d", i, n, cmuxMaxParamsBytes)
+		}
+	}
+	if f.setCalls < 2916*2500/cmuxMaxParamsBytes {
+		t.Errorf("suspiciously few set calls: %d", f.setCalls)
+	}
+}
+
+func TestCmuxPush_OversizedCookieSkippedRestLand(t *testing.T) {
+	f := &fakeCmux{}
+	a := newTestCmux(f, nil)
+	cookies := []chrome.Cookie{
+		bigCookie("ok", 10),
+		bigCookie("giant", cmuxMaxParamsBytes+1),
+	}
+	if err := a.Push(cookies); err != nil {
+		t.Fatalf("an oversized cookie must be skipped, not fail the push: %v", err)
+	}
+	if f.setCalls != 1 {
+		t.Fatalf("want 1 set call, got %d", f.setCalls)
+	}
+	for _, n := range f.setSizes {
+		if n > cmuxMaxParamsBytes {
+			t.Errorf("oversized cookie was sent (%d bytes)", n)
+		}
+	}
+}
+
+func TestCmuxPush_FallbackStaysWithinByteChunk(t *testing.T) {
+	// A payload reject on the second byte-bounded chunk falls back
+	// per-cookie for that chunk only; the first chunk is not resent.
+	f := &fakeCmux{setErrs: []error{
+		nil, // chunk 1
+		errors.New("invalid_params: Invalid cookie payload"), // chunk 2 batch
+	}}
+	a := newTestCmux(f, nil)
+	cookies := make([]chrome.Cookie, 0, 200)
+	for range 200 {
+		cookies = append(cookies, bigCookie("c", 2000))
+	}
+	chunks, _ := cmuxChunks("surface:9", cookies, cmuxMaxParamsBytes)
+	if len(chunks) < 2 {
+		t.Fatalf("test needs >= 2 chunks, got %d", len(chunks))
+	}
+	if err := a.Push(cookies); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	want := len(chunks) + len(chunks[1]) // one call per chunk + per-cookie for chunk 2
+	if f.setCalls != want {
+		t.Errorf("want %d set calls, got %d", want, f.setCalls)
+	}
+}
+
+func TestCmuxPush_SkipsDeadRestoredShells(t *testing.T) {
+	// cmux session-restore leaves browser shells with empty url that fail
+	// every browser.* rpc. Reuse must skip them (two of them, so a
+	// single-avoid reopen could flap) and land on the live surface.
+	dead := errors.New("invalid_params: Surface is not a browser")
+	f := &fakeCmux{
+		treeOuts: []string{cmuxTree(
+			[]string{"surface:20|browser|", "surface:21|browser|"},
+			[]string{"surface:40|browser|https://github.com/"},
+		)},
+		deadSurfaces: map[string]error{"surface:20": dead, "surface:21": dead},
+	}
+	a := newTestCmux(f, nil)
+	if err := a.Push([]chrome.Cookie{{HostKey: ".x.com", Name: "a", Value: "1"}}); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if a.surfaceID != "surface:40" {
+		t.Errorf("want live surface:40, got %q", a.surfaceID)
+	}
+	if n := countAdds(f.calls); n != 0 {
+		t.Errorf("a live browser surface exists; must not add a tab, got %d", n)
+	}
+	for _, c := range f.calls {
+		if len(c) >= 3 && c[1] == "browser.cookies.set" && strings.Contains(c[2], "surface:2") {
+			t.Errorf("cookies sent to a dead shell: %v", c[:2])
+		}
+	}
+}
+
+func TestCmuxPush_AllShellsDeadAddsOneTab(t *testing.T) {
+	dead := errors.New("invalid_params: Surface is not a browser")
+	f := &fakeCmux{
+		treeOuts:     []string{cmuxTree([]string{"surface:20|browser|", "surface:21|browser|"})},
+		deadSurfaces: map[string]error{"surface:20": dead, "surface:21": dead},
+	}
+	a := newTestCmux(f, nil)
+	if err := a.Push([]chrome.Cookie{{HostKey: ".x.com", Name: "a", Value: "1"}}); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if n := countAdds(f.calls); n != 1 {
+		t.Fatalf("want exactly one added tab, got %d", n)
+	}
+	if a.surfaceID != "surface:9" {
+		t.Errorf("want the added surface:9, got %q", a.surfaceID)
+	}
+}
+
+func TestCmuxPush_ProbeNonSurfaceErrorStillReuses(t *testing.T) {
+	// A cmux that doesn't know browser.url.get must not be read as "every
+	// tab is dead" -- that would add a tab per push.
+	f := &fakeCmux{
+		treeOuts:     []string{cmuxTree([]string{"surface:40|browser|"})},
+		deadSurfaces: map[string]error{"surface:40": errors.New("method_not_found: browser.url.get")},
+	}
+	a := newTestCmux(f, nil)
+	if err := a.Push([]chrome.Cookie{{HostKey: ".x.com", Name: "a", Value: "1"}}); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if countAdds(f.calls) != 0 || a.surfaceID != "surface:40" {
+		t.Errorf("want reuse of surface:40 with no add, got %q adds=%d", a.surfaceID, countAdds(f.calls))
+	}
+}
+
+func TestCmuxPush_ProbeCmuxUnavailableHardFails(t *testing.T) {
+	f := &fakeCmux{
+		treeOuts:     []string{cmuxTree([]string{"surface:40|browser|"})},
+		deadSurfaces: map[string]error{"surface:40": errors.New("Failed to write to socket (Broken pipe, errno 32)")},
+	}
+	a := newTestCmux(f, nil)
+	if err := a.Push([]chrome.Cookie{{HostKey: ".x.com", Name: "a", Value: "1"}}); err == nil {
+		t.Fatal("cmux unreachable during the probe must fail the push")
+	}
+	if countAdds(f.calls) != 0 {
+		t.Errorf("must not add a tab when cmux is unreachable")
 	}
 }
