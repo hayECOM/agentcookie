@@ -216,6 +216,26 @@ from the upgrade until this fix. Now:
   cookie the cmux browser rotated itself is no longer clobbered by the
   laptop's copy every 30s, only on the 15-min resync or a source change.
 
+Round-2 honesty fixes (council, 2026-11-02):
+
+- **cmux down is classified as down.** cmux 0.65 with no socket says
+  `Socket not found at <path>`; hung, it says `Socket connection deadline
+  exceeded` / `Socket read error`. All three are `isCmuxUnavailable` --
+  one hard-fail, never a per-cookie exec storm under the push lock.
+  `Socket closed before complete reply` is a retried transient.
+- **The log says what was sent.** `PushCounted` (the optional
+  `CountingPusher` interface RunAll prefers) feeds `adapter cmux pushed N
+  changed of M (U unchanged, R rejected)`. A settled WebKit reject keeps
+  being counted on every line. A push with nothing pending still probes
+  the cached surface (`browser.url.get`), so a quit cmux is a FAIL line,
+  not "pushed 312 cookies"; a dead cached surface reopens and full-pushes.
+- **One cookie per WebKit key.** Chrome's unique key is wider than
+  host/name/path, so the input is deduped (last wins) before the delta --
+  otherwise two rows would alternate in the record and flap the jar value.
+- **Callers hand Push the full set.** The resync only heals jar-side drift
+  if the adapter sees unchanged cookies; `cmux-sync --watch` dropped its
+  own pre-filter for that reason.
+
 cmux session-restore resurrects browser tabs as uninitialized shells: `tree`
 lists them as `browser` with an empty url -- exactly what reuse prefers --
 but every `browser.*` rpc fails `Surface is not a browser`. Reuse now probes
@@ -227,7 +247,11 @@ Guards: `TestCmuxPush_RealisticSetStaysUnderFrameCap`, `TestCmuxChunks_*`,
 `TestCmuxPush_RetriesDroppedFrame`,
 `TestCmuxPush_PersistentDropSkipsChunkKeepsGoingAndResends`,
 `TestCmuxPush_Delta*`, `TestCmuxPush_SkipsDeadRestoredShells`,
-`TestCmuxPush_ProbeNonSurfaceErrorStillReuses`.
+`TestCmuxPush_ProbeNonSurfaceErrorStillReuses`,
+`TestCmuxPush_QuitOrHungCmuxHardFailsFast`,
+`TestCmuxPush_ClosedBeforeCompleteReplyIsRetried`, `TestCmuxPushCounted_*`,
+`TestRunAll_CountingPusherReportsWhatWasSent`, `TestAdapterPushedLine`,
+`TestCmuxPush_DuplicateKeyDoesNotFlap`.
 
 Caveat: cmux exposes no per-surface browser profile in `tree`. If a
 non-default `--profile` browser tab is ever the only one open, cookies would

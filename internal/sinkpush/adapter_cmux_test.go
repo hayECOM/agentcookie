@@ -1205,13 +1205,20 @@ func TestCmuxPush_QuitOrHungCmuxHardFailsFast(t *testing.T) {
 }
 
 func TestCmuxPush_ClosedBeforeCompleteReplyIsRetried(t *testing.T) {
-	f := &fakeCmux{setErrs: []error{errors.New("exit status 1 (Error: Socket closed before complete reply)")}}
+	// The batch is resent whole; unclassified, it would fall to per-cookie
+	// and the second drop would leave a cookie undelivered.
+	drop := errors.New("exit status 1 (Error: Socket closed before complete reply)")
+	f := &fakeCmux{setErrs: []error{drop, drop}}
 	a := newTestCmux(f, nil)
-	if err := a.Push([]chrome.Cookie{{HostKey: ".x.com", Name: "a", Value: "1"}}); err != nil {
+	cookies := []chrome.Cookie{
+		{HostKey: ".x.com", Name: "a", Value: "1"},
+		{HostKey: ".x.com", Name: "b", Value: "2"},
+	}
+	if err := a.Push(cookies); err != nil {
 		t.Fatalf("a dropped frame is resent, got %v", err)
 	}
-	if f.setCalls != 2 {
-		t.Errorf("want one resend, got %d set calls", f.setCalls)
+	if f.setCalls != 3 {
+		t.Errorf("want two batch resends, got %d set calls", f.setCalls)
 	}
 }
 
