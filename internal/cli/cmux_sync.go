@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"os"
 	"sync"
@@ -132,22 +131,10 @@ func runCmuxSync(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("cmux CLI not found at %s (install cmux, or set --cmux-path / cmux.cmux_path in source.yaml)", adapter.CLIBinary())
 	}
 
-	// lastPushed tracks the per-cookie content hash of the last successful
-	// injection (watch mode only; nil in --once). Injected cookies persist
-	// at cmux's WKWebsiteDataStore profile level, so a cookie only needs
-	// re-pushing when its content actually changes -- without this, every
-	// debounced Chrome fs-event re-injected the full multi-thousand-cookie
-	// set (~every 30s, forever).
-	var lastPushed map[string]uint64
-	if cmuxSyncWatch {
-		lastPushed = map[string]uint64{}
-	}
-
 	// The watcher fires pushes as goroutines (the startup push in
 	// particular bypasses the rate cap), so two cycles can overlap. They
-	// would both read the same lastPushed snapshot, compute the same
-	// "everything is new" delta, and double-push the full set -- and race
-	// on the map. Serialize whole cycles.
+	// would both compute the same "everything is new" delta in the adapter
+	// and double-push the full set. Serialize whole cycles.
 	var cycleMu sync.Mutex
 
 	syncOnce := func(ctx context.Context) (int, error) {
@@ -163,31 +150,27 @@ func runCmuxSync(cmd *cobra.Command, args []string) error {
 		}
 		// Apply the cmux domain filter the same way RunAll would before Push.
 		cookies = sinkpush.FilterByHostPatterns(cookies, domainFilter)
-		push := cookies
-		if lastPushed != nil {
-			push = deltaCookies(cookies, lastPushed)
-		}
-		if cmuxSyncVerbose {
-			fmt.Fprintf(os.Stderr, "agentcookie cmux-sync: read %d, filtered %d, dbsc(warn=%d skip=%d), injecting %d (of %d)\n",
-				st.totalRead, st.totalDropped, st.dbsc.warned, st.dbsc.skipped, len(push), len(cookies))
-		}
+		// Hand the adapter the full set every cycle: it pushes only what
+		// changed since it last landed, and its periodic full resync is what
+		// re-sends a cookie WebKit evicted. Pre-filtering to a delta here
+		// would hide unchanged cookies from that resync forever.
 		if cmuxSyncDryRun {
-			fmt.Fprintf(os.Stderr, "agentcookie cmux-sync: dry-run; not injecting %d cookies\n", len(push))
+			if cmuxSyncVerbose {
+				fmt.Fprintf(os.Stderr, "agentcookie cmux-sync: read %d, filtered %d, dbsc(warn=%d skip=%d), %d in scope\n",
+					st.totalRead, st.totalDropped, st.dbsc.warned, st.dbsc.skipped, len(cookies))
+			}
+			fmt.Fprintf(os.Stderr, "agentcookie cmux-sync: dry-run; not injecting %d cookies\n", len(cookies))
 			return 0, nil
 		}
-		if len(push) == 0 {
-			return 0, nil
+		n, err := adapter.PushCounted(cookies)
+		if cmuxSyncVerbose {
+			fmt.Fprintf(os.Stderr, "agentcookie cmux-sync: read %d, filtered %d, dbsc(warn=%d skip=%d), injected %d changed of %d (%d unchanged, %d rejected)\n",
+				st.totalRead, st.totalDropped, st.dbsc.warned, st.dbsc.skipped, n.Sent, n.Total, n.Unchanged, n.Rejected)
 		}
-		if err := adapter.Push(push); err != nil {
+		if err != nil {
 			return 0, err
 		}
-		if lastPushed != nil {
-			// Rebuild from the full current set, not just the delta: every
-			// cookie in it is either unchanged-since-pushed or just pushed,
-			// and rebuilding prunes entries for cookies Chrome deleted.
-			lastPushed = hashCookieSet(cookies)
-		}
-		return len(push), nil
+		return n.Sent, nil
 	}
 
 	if cmuxSyncOnce {
@@ -260,40 +243,4 @@ func reportCmuxVerify(v cmuxVerifier, domainFilter []string, w io.Writer) {
 			fmt.Fprintf(w, "agentcookie cmux-sync: session check: %s unknown (%s)\n", r.Host, r.Detail)
 		}
 	}
-}
-
-// cmuxCookieKey identifies a cookie across sync cycles. Host+name+path is
-// the same identity WebKit upserts on, so a changed value under the same
-// key is an update, not a new cookie.
-func cmuxCookieKey(c chrome.Cookie) string {
-	return c.HostKey + "\x00" + c.Name + "\x00" + c.Path
-}
-
-// cmuxCookieHash digests the fields that matter to injection. Any change
-// flips the hash and re-queues the cookie for push.
-func cmuxCookieHash(c chrome.Cookie) uint64 {
-	h := fnv.New64a()
-	fmt.Fprintf(h, "%s\x00%d\x00%d\x00%d\x00%d", c.Value, c.ExpiresUTC, c.IsSecure, c.IsHTTPOnly, c.SameSite)
-	return h.Sum64()
-}
-
-// deltaCookies returns the cookies that are new or changed relative to
-// the last successfully pushed set.
-func deltaCookies(cookies []chrome.Cookie, lastPushed map[string]uint64) []chrome.Cookie {
-	var out []chrome.Cookie
-	for _, c := range cookies {
-		if h, ok := lastPushed[cmuxCookieKey(c)]; !ok || h != cmuxCookieHash(c) {
-			out = append(out, c)
-		}
-	}
-	return out
-}
-
-// hashCookieSet builds the lastPushed map for a full cookie set.
-func hashCookieSet(cookies []chrome.Cookie) map[string]uint64 {
-	m := make(map[string]uint64, len(cookies))
-	for _, c := range cookies {
-		m[cmuxCookieKey(c)] = cmuxCookieHash(c)
-	}
-	return m
 }

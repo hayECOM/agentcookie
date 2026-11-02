@@ -93,6 +93,7 @@ type CmuxAdapter struct {
 	// last landed, the surface it was recorded against, and when the
 	// record was last reset to force a full push.
 	sent        map[string][32]byte
+	rejected    map[string]bool // keys in sent that WebKit refused
 	sentSurface string
 	lastFull    time.Time
 
@@ -145,12 +146,20 @@ func (a *CmuxAdapter) CookieHostPatterns() []string { return a.domainFilter }
 // (an already-open browser tab, or an unfocused about:blank tab added only
 // when none is open), and re-resolves once if the cached surface has gone
 // away. Only cookies that changed since they last landed are sent (see
-// the delta record below). Errors are returned
+// PushCounted). Errors are returned
 // for RunAll to log; a missing or cmuxOnly-gated cmux is a soft failure
 // that never aborts the sync or the other surfaces.
 func (a *CmuxAdapter) Push(cookies []chrome.Cookie) error {
+	_, err := a.PushCounted(cookies)
+	return err
+}
+
+// PushCounted is Push, reporting how many cookies were actually sent,
+// skipped as unchanged, and refused by WebKit (see PushCounts).
+func (a *CmuxAdapter) PushCounted(cookies []chrome.Cookie) (PushCounts, error) {
+	var n PushCounts
 	if len(cookies) == 0 {
-		return nil
+		return n, nil
 	}
 
 	// Drop RFC-invalid cookies up front (the same gate RunAll applies before
@@ -165,35 +174,40 @@ func (a *CmuxAdapter) Push(cookies []chrome.Cookie) error {
 			valid = append(valid, c)
 		}
 	}
-	cookies = valid
+	cookies = dedupeCmuxKeys(valid)
+	n.Total = len(cookies)
 	if len(cookies) == 0 {
-		return nil
+		return n, nil
 	}
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	if _, err := a.ensureSurfaceLocked(""); err != nil {
-		return fmt.Errorf("cmux: open browser surface: %w", err)
+		return n, fmt.Errorf("cmux: open browser surface: %w", err)
 	}
 
-	// Delta push: resend only cookies whose params changed since they last
-	// landed. A full push is ~300 calls at the frame bound below (~19ms
-	// each) inside the /sync handler, every ~30s; the delta is usually a
-	// handful. The record resets to a full push when the surface changes
-	// and every cmuxFullResync, so drift on the cmux side (a cleared jar, a
-	// cookie WebKit evicted) heals within that window.
-	now := time.Now()
-	if a.sent == nil || a.sentSurface != a.surfaceID || now.Sub(a.lastFull) >= cmuxFullResync {
-		a.sent = make(map[string][32]byte)
-		a.sentSurface = a.surfaceID
-		a.lastFull = now
-	}
-	pending := make([]chrome.Cookie, 0, len(cookies))
-	for _, c := range cookies {
-		if fp, ok := a.sent[cmuxCookieKey(c)]; !ok || fp != cmuxCookieFingerprint(c) {
-			pending = append(pending, c)
+	pending := a.pendingLocked(cookies, &n)
+	if len(pending) == 0 {
+		// Nothing changed, so nothing would contact cmux, and a quit cmux
+		// (or a cached surface it has since dropped) would pass for a clean
+		// push for the whole resync window. One read-only probe keeps the
+		// result honest.
+		alive, err := a.surfaceAliveLocked(a.surfaceID)
+		if err != nil {
+			return n, fmt.Errorf("cmux: probe surface: %w", err)
 		}
+		if alive {
+			return n, nil
+		}
+		stale := a.surfaceID
+		a.surfaceID = ""
+		if _, err := a.ensureSurfaceLocked(stale); err != nil {
+			return n, fmt.Errorf("cmux: reopen surface: %w", err)
+		}
+		// The surface changed, so the record resets and this is a full push.
+		n = PushCounts{Total: n.Total}
+		pending = a.pendingLocked(cookies, &n)
 	}
 
 	// Inject in batches: browser.cookies.set accepts a cookies array, so a
@@ -217,12 +231,13 @@ func (a *CmuxAdapter) Push(cookies []chrome.Cookie) error {
 			stale := a.surfaceID
 			a.surfaceID = ""
 			if _, oerr := a.ensureSurfaceLocked(stale); oerr != nil {
-				return fmt.Errorf("cmux: reopen surface after %v: %w", err, oerr)
+				return n, fmt.Errorf("cmux: reopen surface after %v: %w", err, oerr)
 			}
 			err = a.setCookiesLocked(chunk)
 		}
 		if err == nil {
 			a.markSentLocked(chunk...)
+			n.Sent += len(chunk)
 			continue
 		}
 		// Hard-fail (do not silently drop the chunk) when cmux is unreachable
@@ -230,7 +245,7 @@ func (a *CmuxAdapter) Push(cookies []chrome.Cookie) error {
 		// the one reopen attempt -- a reopen that didn't fix it won't be fixed
 		// per-cookie either, and silently skipping would lose the whole chunk.
 		if isCmuxUnavailable(err) || isSurfaceError(err) {
-			return fmt.Errorf("cmux: set cookies [%d:%d] of %d: %w", start, end, len(pending), err)
+			return n, fmt.Errorf("cmux: set cookies [%d:%d] of %d: %w", start, end, len(pending), err)
 		}
 		// cmux kept dropping the frame through every retry. Move on: the
 		// chunk stays unrecorded, so the next push resends it, and the
@@ -249,12 +264,15 @@ func (a *CmuxAdapter) Push(cookies []chrome.Cookie) error {
 			switch {
 			case e == nil:
 				a.markSentLocked(c)
+				n.Sent++
 			case isCmuxUnavailable(e) || isSurfaceError(e):
-				return fmt.Errorf("cmux: set cookie %q: %w", c.Name, e)
+				return n, fmt.Errorf("cmux: set cookie %q: %w", c.Name, e)
 			case isCookieReject(e):
 				// A genuine reject. Record it so an unchanged reject is not
-				// re-sent (batch fail + per-cookie fallback) on every push.
-				a.markSentLocked(c)
+				// re-sent (batch fail + per-cookie fallback) on every push,
+				// and count it so it never vanishes from the log.
+				a.markRejectedLocked(c)
+				n.Rejected++
 			default:
 				// Dropped frame, or a failure we can't classify: it landed
 				// nothing, so leave it unrecorded and resend next push.
@@ -264,15 +282,73 @@ func (a *CmuxAdapter) Push(cookies []chrome.Cookie) error {
 		}
 	}
 	if undelivered > 0 {
-		return fmt.Errorf("cmux: %d of %d cookies not delivered (resent next push): %w",
+		return n, fmt.Errorf("cmux: %d of %d cookies not delivered (resent next push): %w",
 			undelivered, len(pending), lastDrop)
 	}
-	return nil
+	return n, nil
+}
+
+// pendingLocked returns the cookies whose params changed since they last
+// landed, counting the rest in n as unchanged or (recorded) rejected.
+//
+// Delta push: a full push is ~300 calls at the frame bound (~19ms each)
+// inside the /sync handler, every ~30s; the delta is usually a handful.
+// The record resets to a full push when the surface changes and every
+// cmuxFullResync, so drift on the cmux side (a cleared jar, a cookie
+// WebKit evicted) heals within that window -- for any caller that hands
+// Push the full set each time. Both the sink (RunAll) and cmux-sync do;
+// a caller that pre-filtered to its own delta would defeat the resync.
+// Caller must hold a.mu.
+func (a *CmuxAdapter) pendingLocked(cookies []chrome.Cookie, n *PushCounts) []chrome.Cookie {
+	now := time.Now()
+	if a.sent == nil || a.sentSurface != a.surfaceID || now.Sub(a.lastFull) >= cmuxFullResync {
+		a.sent = make(map[string][32]byte)
+		a.rejected = make(map[string]bool)
+		a.sentSurface = a.surfaceID
+		a.lastFull = now
+	}
+	pending := make([]chrome.Cookie, 0, len(cookies))
+	for _, c := range cookies {
+		k := cmuxCookieKey(c)
+		fp, ok := a.sent[k]
+		switch {
+		case !ok || fp != cmuxCookieFingerprint(c):
+			pending = append(pending, c)
+		case a.rejected[k]:
+			n.Rejected++
+		default:
+			n.Unchanged++
+		}
+	}
+	return pending
 }
 
 // cmuxCookieKey is a cookie's identity in WebKit's jar.
 func cmuxCookieKey(c chrome.Cookie) string {
 	return c.HostKey + "\x00" + c.Name + "\x00" + c.Path
+}
+
+// dedupeCmuxKeys keeps one cookie per cmuxCookieKey: the last, which is
+// the one a batch write leaves in WebKit's jar anyway. Chrome's own unique
+// key is wider (source scheme and port, partition key), so a synced set
+// can carry two rows WebKit stores as one. Sending both would land one
+// value and record the other, and every push would resend the loser --
+// the jar value flapping between them forever.
+func dedupeCmuxKeys(cookies []chrome.Cookie) []chrome.Cookie {
+	last := make(map[string]int, len(cookies))
+	for i, c := range cookies {
+		last[cmuxCookieKey(c)] = i
+	}
+	if len(last) == len(cookies) {
+		return cookies
+	}
+	out := make([]chrome.Cookie, 0, len(last))
+	for i, c := range cookies {
+		if last[cmuxCookieKey(c)] == i {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // cmuxCookieFingerprint hashes the params a cookie is pushed with, so the
@@ -286,8 +362,18 @@ func cmuxCookieFingerprint(c chrome.Cookie) [32]byte {
 // Caller must hold a.mu.
 func (a *CmuxAdapter) markSentLocked(cookies ...chrome.Cookie) {
 	for _, c := range cookies {
-		a.sent[cmuxCookieKey(c)] = cmuxCookieFingerprint(c)
+		k := cmuxCookieKey(c)
+		a.sent[k] = cmuxCookieFingerprint(c)
+		delete(a.rejected, k)
 	}
+}
+
+// markRejectedLocked records a cookie WebKit refused, so the unchanged
+// reject is counted rather than resent. Caller must hold a.mu.
+func (a *CmuxAdapter) markRejectedLocked(c chrome.Cookie) {
+	k := cmuxCookieKey(c)
+	a.sent[k] = cmuxCookieFingerprint(c)
+	a.rejected[k] = true
 }
 
 // ensureSurfaceLocked returns the cached injection surface ref. With no
@@ -682,6 +768,12 @@ func isCmuxUnavailable(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "connection refused") ||
+		// cmux 0.65 quit: no socket file at all.
+		strings.Contains(msg, "socket not found") ||
+		// cmux hung: retrying per cookie would multiply the timeout under
+		// the push lock.
+		strings.Contains(msg, "socket connection deadline exceeded") ||
+		strings.Contains(msg, "socket read error") ||
 		strings.Contains(msg, "access denied") ||
 		strings.Contains(msg, "permission denied") || // EACCES (unexecutable cmux mid-run)
 		strings.Contains(msg, "only processes started inside cmux") ||
@@ -699,6 +791,7 @@ func isTransientSocketError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "broken pipe") ||
 		strings.Contains(msg, "socket closed before reply") ||
+		strings.Contains(msg, "socket closed before complete reply") ||
 		strings.Contains(msg, "failed to write to socket")
 }
 

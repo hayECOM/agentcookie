@@ -66,6 +66,29 @@ type Adapter interface {
 	Push(cookies []chrome.Cookie) error
 }
 
+// PushCounts is what an adapter actually did with the cookies one Push
+// was handed. Only adapters that do not send everything they are handed
+// (cmux's delta push) report it; see CountingPusher.
+type PushCounts struct {
+	// Total is the cookies considered, after the adapter's own filtering.
+	Total int
+	// Sent is the cookies delivered by this push.
+	Sent int
+	// Unchanged is the cookies skipped because they already landed with
+	// these exact params.
+	Unchanged int
+	// Rejected is the cookies the target refuses outright (new this push
+	// or recorded earlier). They are not resent while unchanged.
+	Rejected int
+}
+
+// CountingPusher is an optional Adapter extension. RunAll prefers it to
+// Push so Result.Pushed is what was sent, not what was handed over -- a
+// delta push that sent nothing must not log "pushed 312 cookies".
+type CountingPusher interface {
+	PushCounted(cookies []chrome.Cookie) (PushCounts, error)
+}
+
 // Result is one adapter's outcome from a RunAll pass.
 type Result struct {
 	// Name carries the adapter's Name for log/status output.
@@ -81,8 +104,15 @@ type Result struct {
 	SkippedReason string
 
 	// Pushed is the count of cookies the adapter wrote on
-	// success. Zero when the adapter was skipped or errored.
+	// success (for a CountingPusher, the count it actually sent). Zero
+	// when the adapter was skipped or errored.
 	Pushed int
+
+	// Unchanged and Rejected are reported by a CountingPusher: cookies
+	// skipped because they already landed, and cookies the target refuses
+	// outright. Both zero for a plain Adapter.
+	Unchanged int
+	Rejected  int
 
 	// Invalid is the count of cookies dropped by the validator
 	// before reaching Push: cookies whose Name, Value, or HostKey

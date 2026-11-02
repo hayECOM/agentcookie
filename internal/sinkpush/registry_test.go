@@ -214,3 +214,31 @@ func TestRunAll_SkipsExpiredCookies(t *testing.T) {
 		t.Errorf("pushed = %v, want only the session cookie", a.pushed)
 	}
 }
+
+// countingStub is a CountingPusher that reports a delta.
+type countingStub struct {
+	stubAdapter
+	counts PushCounts
+}
+
+func (s *countingStub) PushCounted(c []chrome.Cookie) (PushCounts, error) {
+	s.pushed = append(s.pushed, c)
+	return s.counts, s.pushErr
+}
+
+func TestRunAll_CountingPusherReportsWhatWasSent(t *testing.T) {
+	resetForTesting()
+	a := &countingStub{
+		stubAdapter: stubAdapter{name: "cmux", installed: true},
+		counts:      PushCounts{Total: 3, Sent: 1, Unchanged: 1, Rejected: 1},
+	}
+	Register(a)
+	r := RunAll([]chrome.Cookie{
+		{HostKey: ".x.com", Name: "a", Value: "1"},
+		{HostKey: ".x.com", Name: "b", Value: "2"},
+		{HostKey: ".x.com", Name: "c", Value: "3"},
+	})[0]
+	if r.Pushed != 1 || r.Unchanged != 1 || r.Rejected != 1 {
+		t.Errorf("want pushed 1 unchanged 1 rejected 1, got %+v", r)
+	}
+}
