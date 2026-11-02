@@ -210,8 +210,9 @@ from the upgrade until this fix. Now:
 - **Delta push.** A full push is now ~300 calls (~19ms each) inside the
   `/sync` handler, so the adapter fingerprints (sha256, no values held) what
   landed and resends only changed cookies. The record resets on a surface
-  change and every `cmuxFullResync` (15 min). WebKit rejects are recorded
-  too, so an unchanged reject is not re-sent each push. Side effect: a
+  change and every `cmuxFullResync` (15 min). A positive WebKit reject
+  (`Invalid cookie payload`) is recorded too, so an unchanged reject is not
+  re-sent each push; any unclassified failure stays unrecorded and is resent. Side effect: a
   cookie the cmux browser rotated itself is no longer clobbered by the
   laptop's copy every 30s, only on the 15-min resync or a source change.
 

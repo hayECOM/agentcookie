@@ -1155,3 +1155,24 @@ func TestCmuxPush_UnchangedRejectNotResentEveryPush(t *testing.T) {
 		t.Errorf("unchanged reject resent: %d -> %d calls", n, f.setCalls)
 	}
 }
+
+func TestCmuxPush_UnknownFallbackFailureIsResent(t *testing.T) {
+	// cmux's socket vanishes mid-push with an error none of the classifiers
+	// know. The batch falls back per-cookie; those failures landed nothing,
+	// so they must not be recorded as settled rejects -- the next push
+	// (cmux back) resends them.
+	gone := errors.New("dial unix /tmp/cmux.sock: no such file or directory")
+	f := &fakeCmux{setErrs: []error{gone, gone}}
+	a := newTestCmux(f, nil)
+	cookies := []chrome.Cookie{{HostKey: ".x.com", Name: "a", Value: "1"}}
+	if err := a.Push(cookies); err == nil || !strings.Contains(err.Error(), "1 of 1 cookies not delivered") {
+		t.Fatalf("want an undelivered report, got %v", err)
+	}
+	n := f.setCalls
+	if err := a.Push(cookies); err != nil {
+		t.Fatalf("second Push: %v", err)
+	}
+	if f.setCalls != n+1 {
+		t.Errorf("unknown failure must be resent once cmux recovers: %d -> %d calls", n, f.setCalls)
+	}
+}

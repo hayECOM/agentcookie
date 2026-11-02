@@ -251,19 +251,21 @@ func (a *CmuxAdapter) Push(cookies []chrome.Cookie) error {
 				a.markSentLocked(c)
 			case isCmuxUnavailable(e) || isSurfaceError(e):
 				return fmt.Errorf("cmux: set cookie %q: %w", c.Name, e)
-			case isTransientSocketError(e):
-				undelivered++
-				lastDrop = e
-			default:
+			case isCookieReject(e):
 				// A genuine reject. Record it so an unchanged reject is not
 				// re-sent (batch fail + per-cookie fallback) on every push.
 				a.markSentLocked(c)
+			default:
+				// Dropped frame, or a failure we can't classify: it landed
+				// nothing, so leave it unrecorded and resend next push.
+				undelivered++
+				lastDrop = e
 			}
 		}
 	}
 	if undelivered > 0 {
-		return fmt.Errorf("cmux: %d of %d cookies not delivered (frame dropped through %d retries; resent next push): %w",
-			undelivered, len(pending), cmuxTransientRetries, lastDrop)
+		return fmt.Errorf("cmux: %d of %d cookies not delivered (resent next push): %w",
+			undelivered, len(pending), lastDrop)
 	}
 	return nil
 }
@@ -698,6 +700,14 @@ func isTransientSocketError(err error) bool {
 	return strings.Contains(msg, "broken pipe") ||
 		strings.Contains(msg, "socket closed before reply") ||
 		strings.Contains(msg, "failed to write to socket")
+}
+
+// isCookieReject reports whether err is cmux refusing one cookie's
+// payload ("invalid_params: Invalid cookie payload", e.g. a value over
+// WebKit's 4096-byte limit) -- the only failure the delta push may record
+// as settled, since resending an unchanged reject can never succeed.
+func isCookieReject(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "invalid cookie payload")
 }
 
 // execCmux runs a cmux subcommand, returning stdout. A non-zero exit
