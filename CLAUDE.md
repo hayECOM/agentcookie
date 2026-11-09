@@ -416,6 +416,19 @@ Guards: `TestPullRefusesKeyOfSinkNotInSinksList`,
 `TestLegacySharedSecretRefusedOnPull`, `TestPullListenerOffWithoutOptIn`,
 `TestPullListenerServesListedSinkWhenOptedIn`.
 
+## The live-CDP stale-tab sweep must re-read before every close
+
+`livecdp.SweepStaleBlankTabs` (started by `runSink` and by `sink
+--pull-loop`) closes `about:blank` tabs older injectors leaked into the
+shared Chrome. It batches full target listings (one per 50 closes) for
+speed, so every candidate is re-read with `Target.getTargetInfo`
+immediately before its close and skipped if another client navigated,
+attached to or closed it. Do not drop that per-close read to "save a
+call"; a stale listing closes live tabs. Guards:
+`TestCloseStaleBlanks_SparesTabChangedMidBatch`,
+`TestRunSinkStartsLiveCDPSweep`, `TestTeammatePullLoopStartsLiveCDPSweep`.
+Upstream PRs: mvanhorn/agentcookie #156 (livecdp) and #157 (cmux reuse).
+
 ## Known rough edges (not fixed)
 
 - `sink.err.log` is unrotated and was ~44 MB as of 2026-08-13.
