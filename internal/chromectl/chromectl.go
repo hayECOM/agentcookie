@@ -23,9 +23,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"sync/atomic"
+	"testing"
 	"time"
 )
 
@@ -40,19 +42,43 @@ var ErrQuitTimeout = errors.New("chromectl: Chrome did not exit within the deadl
 var ErrLaunchTimeout = errors.New("chromectl: Chrome did not become ready within the deadline")
 
 // Test seams. Production code runs the real /usr/bin tools; tests swap
-// all three so no test can quit or signal the developer's real Chrome.
+// them so no test can quit or signal the developer's real Chrome.
 var (
 	// runOsascript runs one AppleScript and returns its combined output.
 	runOsascript = func(ctx context.Context, script string) ([]byte, error) {
+		guardRealChrome("osascript")
 		return exec.CommandContext(ctx, "/usr/bin/osascript", "-e", script).CombinedOutput()
 	}
 	// isRunning probes for a live Chrome process.
 	isRunning = pgrepRunning
 	// sendSignal delivers sig ("TERM" or "KILL") to every Chrome process.
 	sendSignal = func(ctx context.Context, sig string) error {
+		guardRealChrome("pkill")
 		return exec.CommandContext(ctx, "/usr/bin/pkill", "-"+sig, "-x", "Google Chrome").Run()
 	}
+	// launchChrome starts Google Chrome via open(1).
+	launchChrome = func(ctx context.Context) ([]byte, error) {
+		guardRealChrome("open")
+		return exec.CommandContext(ctx, "/usr/bin/open", "-a", "Google Chrome").CombinedOutput()
+	}
 )
+
+// LiveChromeEnv opts a test binary into the real tools. Without it, a test
+// that reaches osascript, pkill, pgrep or open panics instead.
+const LiveChromeEnv = "AGENTCOOKIE_TEST_REAL_CHROME"
+
+// guardRealChrome stops a test binary from touching the machine's real
+// Chrome. osascript quit and pkill act on EVERY Google Chrome process,
+// including a human browser on its own user-data-dir: on 2026-11-09 a
+// `go test ./...` quit the human Chrome lane through this package. A panic
+// fails the test that got here and names it; a returned error would be
+// swallowed by the signal fallback. Even pgrep is refused, so the guard
+// trips whether or not Chrome happens to be running.
+func guardRealChrome(tool string) {
+	if testing.Testing() && os.Getenv(LiveChromeEnv) != "1" {
+		panic(fmt.Sprintf("chromectl: a test reached the real %s against Google Chrome; stub chromectl (set %s=1 only for a live test)", tool, LiveChromeEnv))
+	}
+}
 
 // appleScriptTimeout bounds the osascript quit on its own, apart from the
 // caller's context.
@@ -69,6 +95,7 @@ func IsRunning() (bool, error) {
 }
 
 func pgrepRunning() (bool, error) {
+	guardRealChrome("pgrep")
 	out, err := exec.Command("/usr/bin/pgrep", "-x", "Google Chrome").CombinedOutput()
 	if err != nil {
 		var exitErr *exec.ExitError
@@ -211,8 +238,7 @@ func LaunchAndWait(ctx context.Context, timeout time.Duration) error {
 	if running {
 		return nil
 	}
-	cmd := exec.CommandContext(ctx, "/usr/bin/open", "-a", "Google Chrome")
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := launchChrome(ctx); err != nil {
 		return fmt.Errorf("chromectl: open Chrome: %w (%s)", err, strings.TrimSpace(string(out)))
 	}
 	deadline := time.Now().Add(timeout)

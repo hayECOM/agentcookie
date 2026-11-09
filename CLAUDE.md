@@ -134,6 +134,27 @@ point at a long-lived reader profile: the synced origin arrives, a blocklisted
 origin does not, and the reader's own origins survive. Swap the per-origin write
 for a directory replace and the last two go red.
 
+### The test suite must never quit a real Chrome (2026-11-09)
+
+`chromectl` quits Chrome with `osascript ... quit` and `pkill -x "Google
+Chrome"`. Both hit **every** Google Chrome on the machine, including the
+human Chrome lane (`dev.agentcookie.human-chrome`, CDP 9223), which is a
+separate user-data-dir but the same app. On 2026-11-09 a `go test ./...`
+quit it: `TestSinkUniversalMode_StillUnionsExtraProfiles` posts to a
+non-skip sink, `applyEnvelopeToSink` called the real
+`chromectl.WithChromeDown`, and the lane stayed down ~80 min (its
+KeepAlive restarts only on a crash).
+
+Now every real tool in `chromectl` (osascript, pkill, pgrep, open) calls
+`guardRealChrome`, which **panics inside a test binary** unless
+`AGENTCOOKIE_TEST_REAL_CHROME=1`. `internal/cli` routes the ceremony
+through the `chromeDown` seam, and its `TestMain` stubs it. A new package
+that reaches chromectl in a test will panic and name the test. Stub it;
+do not set the env var to make the panic go away. Production is
+unaffected: `testing.Testing()` is false there, and this sink never takes
+the quit path anyway (`skip_chrome_sqlite: true`). Guards:
+`TestGuard_RealToolsPanicInTests`, `TestGuard_LiveOptInAllowsRealTools`.
+
 ## Rebuild / install / bounce
 
 ```bash

@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// fakeChrome stands in for osascript, pgrep and pkill. Chrome is up until
+// fakeChrome stands in for osascript, pgrep, pkill and open. Chrome is up until
 // a signal arrives; the AppleScript quit itself never stops it, which is
 // what happens when automation is refused or unanswered.
 type fakeChrome struct {
@@ -17,6 +17,7 @@ type fakeChrome struct {
 	running  bool
 	osaCalls int
 	signals  []string
+	launches int
 	// termDelay keeps Chrome alive for this long after SIGTERM, the way a
 	// real Chrome takes a moment to shut down. Zero means TERM is instant.
 	termDelay time.Duration
@@ -39,10 +40,10 @@ func (f *fakeChrome) snapshot() (int, []string) {
 func stubChrome(t *testing.T, osa func(ctx context.Context) ([]byte, error)) *fakeChrome {
 	t.Helper()
 	f := &fakeChrome{running: true}
-	origOsa, origRunning, origSignal, origBound := runOsascript, isRunning, sendSignal, appleScriptTimeout
+	origOsa, origRunning, origSignal, origLaunch, origBound := runOsascript, isRunning, sendSignal, launchChrome, appleScriptTimeout
 	appleEventsRefused.Store(false)
 	t.Cleanup(func() {
-		runOsascript, isRunning, sendSignal, appleScriptTimeout = origOsa, origRunning, origSignal, origBound
+		runOsascript, isRunning, sendSignal, launchChrome, appleScriptTimeout = origOsa, origRunning, origSignal, origLaunch, origBound
 		appleEventsRefused.Store(false)
 	})
 	runOsascript = func(ctx context.Context, _ string) ([]byte, error) {
@@ -66,6 +67,13 @@ func stubChrome(t *testing.T, osa func(ctx context.Context) ([]byte, error)) *fa
 		}
 		f.running = false
 		return nil
+	}
+	launchChrome = func(context.Context) ([]byte, error) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.launches++
+		f.running = true
+		return nil, nil
 	}
 	return f
 }
