@@ -2,6 +2,7 @@ package sinkpush
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -36,9 +37,11 @@ var surfaceRefRE = regexp.MustCompile(`surface:\d+`)
 // adapters) and fires after every sync through sinkpush.RunAll.
 //
 // Unlike the per-CLI adapters, this surface is opt-in: the sink only
-// registers it when sink.yaml sets `cmux.enabled: true`. It is wired in
-// internal/cli/sink.go at sink startup rather than in init.go, because
-// it carries config (binary path, host filter) that init() cannot see.
+// runs it when sink.yaml sets `cmux.enabled: true`. internal/cli/sink.go
+// resolves it from the config each apply is handed and passes it to
+// RunAll as a per-call adapter, rather than registering it in init.go,
+// because it carries config (binary path, host filter) that init()
+// cannot see and that can change between pulls.
 //
 // Injection surface (reuse an open browser tab; add one only as a last
 // resort): browser.cookies.set requires a browser surface_id -- there is
@@ -97,9 +100,9 @@ type CmuxAdapter struct {
 	sentSurface string
 	lastFull    time.Time
 
-	// run executes a cmux subcommand and returns stdout. Swappable in
-	// tests; defaults to execCmux.
-	run func(args ...string) (string, error)
+	// run executes a cmux subcommand under ctx and returns stdout.
+	// Swappable in tests; defaults to execCmux.
+	run func(ctx context.Context, args ...string) (string, error)
 
 	// sleep waits between auth-verify poll attempts (see verify.go). Swappable
 	// in tests to avoid real waits; defaults to time.Sleep.
@@ -115,6 +118,21 @@ func NewCmux(cmuxPath string, domainFilter []string) *CmuxAdapter {
 	a.run = a.execCmux
 	a.sleep = time.Sleep
 	return a
+}
+
+// Reconfigured returns a cmux adapter with new settings that keeps a's
+// hidden background tab, so a settings change never leaves an unused tab
+// open in cmux. A tab that is gone is re-added once on the next push, as
+// with any stale surface.
+func (a *CmuxAdapter) Reconfigured(cmuxPath string, domainFilter []string) *CmuxAdapter {
+	n := NewCmux(cmuxPath, domainFilter)
+	a.mu.Lock()
+	n.surfaceID = a.surfaceID
+	// The delta record belongs to that tab, so it moves with it; otherwise
+	// every reconfigure would cost a full push.
+	n.sent, n.rejected, n.sentSurface, n.lastFull = a.sent, a.rejected, a.sentSurface, a.lastFull
+	a.mu.Unlock()
+	return n
 }
 
 // ResolveCmuxBinary returns the cmux CLI path to use: the explicit
@@ -150,13 +168,21 @@ func (a *CmuxAdapter) CookieHostPatterns() []string { return a.domainFilter }
 // for RunAll to log; a missing or cmuxOnly-gated cmux is a soft failure
 // that never aborts the sync or the other surfaces.
 func (a *CmuxAdapter) Push(cookies []chrome.Cookie) error {
-	_, err := a.PushCounted(cookies)
+	return a.PushContext(context.Background(), cookies)
+}
+
+// PushContext is Push bounded by ctx: every cmux command it runs is
+// killed when ctx ends, and a done ctx fails the push rather than being
+// mistaken for a per-cookie reject.
+func (a *CmuxAdapter) PushContext(ctx context.Context, cookies []chrome.Cookie) error {
+	_, err := a.PushCounted(ctx, cookies)
 	return err
 }
 
-// PushCounted is Push, reporting how many cookies were actually sent,
-// skipped as unchanged, and refused by WebKit (see PushCounts).
-func (a *CmuxAdapter) PushCounted(cookies []chrome.Cookie) (PushCounts, error) {
+// PushCounted is PushContext, reporting how many cookies were actually
+// sent, skipped as unchanged, and refused by WebKit (see PushCounts).
+// RunAll calls it with the caller's budget.
+func (a *CmuxAdapter) PushCounted(ctx context.Context, cookies []chrome.Cookie) (PushCounts, error) {
 	var n PushCounts
 	if len(cookies) == 0 {
 		return n, nil
@@ -183,7 +209,7 @@ func (a *CmuxAdapter) PushCounted(cookies []chrome.Cookie) (PushCounts, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if _, err := a.ensureSurfaceLocked(""); err != nil {
+	if _, err := a.ensureSurfaceLocked(ctx, ""); err != nil {
 		return n, fmt.Errorf("cmux: open browser surface: %w", err)
 	}
 
@@ -193,7 +219,7 @@ func (a *CmuxAdapter) PushCounted(cookies []chrome.Cookie) (PushCounts, error) {
 		// (or a cached surface it has since dropped) would pass for a clean
 		// push for the whole resync window. One read-only probe keeps the
 		// result honest.
-		alive, err := a.surfaceAliveLocked(a.surfaceID)
+		alive, err := a.surfaceAliveLocked(ctx, a.surfaceID)
 		if err != nil {
 			return n, fmt.Errorf("cmux: probe surface: %w", err)
 		}
@@ -202,7 +228,7 @@ func (a *CmuxAdapter) PushCounted(cookies []chrome.Cookie) (PushCounts, error) {
 		}
 		stale := a.surfaceID
 		a.surfaceID = ""
-		if _, err := a.ensureSurfaceLocked(stale); err != nil {
+		if _, err := a.ensureSurfaceLocked(ctx, stale); err != nil {
 			return n, fmt.Errorf("cmux: reopen surface: %w", err)
 		}
 		// The surface changed, so the record resets and this is a full push.
@@ -221,7 +247,12 @@ func (a *CmuxAdapter) PushCounted(cookies []chrome.Cookie) (PushCounts, error) {
 	for _, chunk := range cmuxChunks(a.surfaceID, pending, cmuxMaxParamsBytes) {
 		start := end
 		end += len(chunk)
-		err := a.setCookiesLocked(chunk)
+		err := a.setCookiesLocked(ctx, chunk)
+		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return n, fmt.Errorf("cmux: set cookies [%d:%d] of %d: %w", start, end, len(pending), cerr)
+			}
+		}
 		// The cached surface may have been closed between syncs. Re-resolve
 		// once (reusing another open browser tab before adding one) and
 		// retry this chunk before giving up. The stale ref is excluded so a
@@ -230,10 +261,10 @@ func (a *CmuxAdapter) PushCounted(cookies []chrome.Cookie) (PushCounts, error) {
 			reopened = true
 			stale := a.surfaceID
 			a.surfaceID = ""
-			if _, oerr := a.ensureSurfaceLocked(stale); oerr != nil {
+			if _, oerr := a.ensureSurfaceLocked(ctx, stale); oerr != nil {
 				return n, fmt.Errorf("cmux: reopen surface after %v: %w", err, oerr)
 			}
-			err = a.setCookiesLocked(chunk)
+			err = a.setCookiesLocked(ctx, chunk)
 		}
 		if err == nil {
 			a.markSentLocked(chunk...)
@@ -260,7 +291,12 @@ func (a *CmuxAdapter) PushCounted(cookies []chrome.Cookie) (PushCounts, error) {
 		// of the chunk still lands; skip only the genuine individual rejects.
 		// A cmux-unavailable or surface error mid-fallback still hard-fails.
 		for _, c := range chunk {
-			e := a.setCookiesLocked([]chrome.Cookie{c})
+			e := a.setCookiesLocked(ctx, []chrome.Cookie{c})
+			if e != nil {
+				if cerr := ctx.Err(); cerr != nil {
+					return n, fmt.Errorf("cmux: set cookie %q: %w", c.Name, cerr)
+				}
+			}
 			switch {
 			case e == nil:
 				a.markSentLocked(c)
@@ -386,11 +422,11 @@ func (a *CmuxAdapter) markRejectedLocked(c chrome.Cookie) {
 // browser.url.get and then the target of browser.cookies.set --
 // nothing here navigates, focuses or closes it.
 // Caller must hold a.mu.
-func (a *CmuxAdapter) ensureSurfaceLocked(avoid string) (string, error) {
+func (a *CmuxAdapter) ensureSurfaceLocked(ctx context.Context, avoid string) (string, error) {
 	if a.surfaceID != "" {
 		return a.surfaceID, nil
 	}
-	treeOut, err := a.run("tree", "--all", "--json")
+	treeOut, err := a.run(ctx, "tree", "--all", "--json")
 	if err != nil && isCmuxUnavailable(err) {
 		return "", err
 	}
@@ -399,7 +435,7 @@ func (a *CmuxAdapter) ensureSurfaceLocked(avoid string) (string, error) {
 	// beats no delivery.
 	if err == nil {
 		for _, sid := range reusableBrowserSurfaces(treeOut, avoid) {
-			alive, perr := a.surfaceAliveLocked(sid)
+			alive, perr := a.surfaceAliveLocked(ctx, sid)
 			if perr != nil {
 				return "", perr
 			}
@@ -409,14 +445,14 @@ func (a *CmuxAdapter) ensureSurfaceLocked(avoid string) (string, error) {
 			}
 		}
 	}
-	ws, err := a.hostWorkspaceLocked()
+	ws, err := a.hostWorkspaceLocked(ctx)
 	if err != nil {
 		return "", fmt.Errorf("host workspace: %w", err)
 	}
 	// --focus false adds the about:blank as a non-selected background tab,
 	// so the user's selected surface stays put and nothing pops into view.
 	// cmux picks the workspace's active pane when --pane is omitted.
-	out, err := a.run("new-surface", "--type", "browser", "--workspace", ws, "--url", "about:blank", "--focus", "false")
+	out, err := a.run(ctx, "new-surface", "--type", "browser", "--workspace", ws, "--url", "about:blank", "--focus", "false")
 	if err != nil {
 		return "", err
 	}
@@ -437,9 +473,9 @@ func (a *CmuxAdapter) ensureSurfaceLocked(avoid string) (string, error) {
 // other failure (say, a cmux without browser.url.get) counts as alive so
 // it never pushes the adapter into adding a tab per push.
 // Caller must hold a.mu.
-func (a *CmuxAdapter) surfaceAliveLocked(sid string) (bool, error) {
+func (a *CmuxAdapter) surfaceAliveLocked(ctx context.Context, sid string) (bool, error) {
 	params, _ := json.Marshal(map[string]string{"surface_id": sid})
-	_, err := a.run("rpc", "browser.url.get", string(params))
+	_, err := a.run(ctx, "rpc", "browser.url.get", string(params))
 	switch {
 	case err == nil:
 		return true, nil
@@ -503,8 +539,8 @@ func reusableBrowserSurfaces(treeJSON, avoid string) []string {
 // every time a surface must be (re)added -- never cached -- because short
 // refs renumber across cmux restarts and this process outlives cmux.
 // Caller must hold a.mu.
-func (a *CmuxAdapter) hostWorkspaceLocked() (string, error) {
-	out, err := a.run("workspace", "list", "--json")
+func (a *CmuxAdapter) hostWorkspaceLocked(ctx context.Context) (string, error) {
+	out, err := a.run(ctx, "workspace", "list", "--json")
 	if err != nil {
 		return "", err
 	}
@@ -590,14 +626,14 @@ func cmuxChunks(surfaceID string, cookies []chrome.Cookie, maxBytes int) [][]chr
 // setCookiesLocked sends a batch of cookies to the cached surface in one
 // browser.cookies.set call. Caller must hold a.mu and have a non-empty
 // a.surfaceID.
-func (a *CmuxAdapter) setCookiesLocked(cookies []chrome.Cookie) error {
+func (a *CmuxAdapter) setCookiesLocked(ctx context.Context, cookies []chrome.Cookie) error {
 	payload, err := cmuxCookiesJSON(a.surfaceID, cookies)
 	if err != nil {
 		return fmt.Errorf("marshal %d cookies: %w", len(cookies), err)
 	}
 	for attempt := 0; ; attempt++ {
-		_, err = a.run("rpc", "browser.cookies.set", payload)
-		if err == nil || !isTransientSocketError(err) || attempt >= cmuxTransientRetries {
+		_, err = a.run(ctx, "rpc", "browser.cookies.set", payload)
+		if err == nil || ctx.Err() != nil || !isTransientSocketError(err) || attempt >= cmuxTransientRetries {
 			return err
 		}
 		a.sleep(time.Duration(attempt+1) * 20 * time.Millisecond)
@@ -805,9 +841,12 @@ func isCookieReject(err error) bool {
 
 // execCmux runs a cmux subcommand, returning stdout. A non-zero exit
 // folds stderr (or stdout, when cmux writes the error there) into the
-// returned error so callers can match on the message.
-func (a *CmuxAdapter) execCmux(args ...string) (string, error) {
-	cmd := exec.Command(a.binary, args...)
+// returned error so callers can match on the message. The command is
+// killed when ctx ends; WaitDelay stops a grandchild holding the output
+// pipes from keeping Wait blocked past that.
+func (a *CmuxAdapter) execCmux(ctx context.Context, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, a.binary, args...)
+	cmd.WaitDelay = childWaitDelay
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

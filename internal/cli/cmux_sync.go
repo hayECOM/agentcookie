@@ -162,7 +162,7 @@ func runCmuxSync(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(os.Stderr, "agentcookie cmux-sync: dry-run; not injecting %d cookies\n", len(cookies))
 			return 0, nil
 		}
-		n, err := adapter.PushCounted(cookies)
+		n, err := adapter.PushCounted(ctx, cookies)
 		if cmuxSyncVerbose {
 			fmt.Fprintf(os.Stderr, "agentcookie cmux-sync: read %d, filtered %d, dbsc(warn=%d skip=%d), injected %d changed of %d (%d unchanged, %d rejected)\n",
 				st.totalRead, st.totalDropped, st.dbsc.warned, st.dbsc.skipped, n.Sent, n.Total, n.Unchanged, n.Rejected)

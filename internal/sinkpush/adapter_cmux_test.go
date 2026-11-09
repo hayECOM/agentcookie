@@ -1,6 +1,7 @@
 package sinkpush
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -146,7 +147,7 @@ func flagValue(args []string, flag string) string {
 
 func newTestCmux(f *fakeCmux, filter []string) *CmuxAdapter {
 	a := &CmuxAdapter{binary: "/fake/cmux", domainFilter: filter}
-	a.run = f.run
+	a.run = func(_ context.Context, args ...string) (string, error) { return f.run(args...) }
 	a.sleep = func(time.Duration) {} // no real waits in tests
 	return a
 }
@@ -1230,12 +1231,12 @@ func TestCmuxPushCounted_ReportsSentNotHanded(t *testing.T) {
 		{HostKey: ".x.com", Name: "b", Value: "2"},
 		{HostKey: ".x.com", Name: "c", Value: "3"},
 	}
-	n, err := a.PushCounted(cookies)
+	n, err := a.PushCounted(context.Background(), cookies)
 	if err != nil || n != (PushCounts{Total: 3, Sent: 3}) {
 		t.Fatalf("first push: %+v, %v", n, err)
 	}
 	cookies[1].Value = "rotated"
-	n, err = a.PushCounted(cookies)
+	n, err = a.PushCounted(context.Background(), cookies)
 	if err != nil || n != (PushCounts{Total: 3, Sent: 1, Unchanged: 2}) {
 		t.Fatalf("delta push: %+v, %v", n, err)
 	}
@@ -1246,11 +1247,11 @@ func TestCmuxPushCounted_NothingPendingProbesCmux(t *testing.T) {
 	f := &fakeCmux{}
 	a := newTestCmux(f, nil)
 	cookies := []chrome.Cookie{{HostKey: ".x.com", Name: "a", Value: "1"}}
-	if _, err := a.PushCounted(cookies); err != nil {
+	if _, err := a.PushCounted(context.Background(), cookies); err != nil {
 		t.Fatal(err)
 	}
 	f.deadSurfaces = map[string]error{a.surfaceID: errors.New("exit status 1 (Error: Socket not found at /x)")}
-	n, err := a.PushCounted(cookies)
+	n, err := a.PushCounted(context.Background(), cookies)
 	if err == nil {
 		t.Fatalf("a quit cmux must fail even when nothing changed, got %+v", n)
 	}
@@ -1263,11 +1264,11 @@ func TestCmuxPushCounted_DeadCachedSurfaceForcesFullPush(t *testing.T) {
 	f := &fakeCmux{treeOuts: []string{cmuxTree([]string{"surface:3|browser|"}), cmuxTree([]string{"surface:3|browser|", "surface:4|browser|"})}}
 	a := newTestCmux(f, nil)
 	cookies := []chrome.Cookie{{HostKey: ".x.com", Name: "a", Value: "1"}}
-	if _, err := a.PushCounted(cookies); err != nil {
+	if _, err := a.PushCounted(context.Background(), cookies); err != nil {
 		t.Fatal(err)
 	}
 	f.deadSurfaces = map[string]error{"surface:3": errors.New("Surface is not a browser")}
-	n, err := a.PushCounted(cookies)
+	n, err := a.PushCounted(context.Background(), cookies)
 	if err != nil || n.Sent != 1 || a.surfaceID != "surface:4" {
 		t.Fatalf("dead cached surface should reopen and full-push: %+v, %v, surface %s", n, err, a.surfaceID)
 	}
@@ -1281,11 +1282,11 @@ func TestCmuxPushCounted_SettledRejectStaysCounted(t *testing.T) {
 		{HostKey: ".x.com", Name: "good", Value: "1"},
 		{HostKey: ".x.com", Name: "bad", Value: "2"},
 	}
-	n, err := a.PushCounted(cookies)
+	n, err := a.PushCounted(context.Background(), cookies)
 	if err != nil || n != (PushCounts{Total: 2, Sent: 1, Rejected: 1}) {
 		t.Fatalf("first push: %+v, %v", n, err)
 	}
-	n, err = a.PushCounted(cookies)
+	n, err = a.PushCounted(context.Background(), cookies)
 	if err != nil || n != (PushCounts{Total: 2, Unchanged: 1, Rejected: 1}) {
 		t.Fatalf("a settled reject must keep being counted: %+v, %v", n, err)
 	}
@@ -1312,5 +1313,41 @@ func TestCmuxPush_DuplicateKeyDoesNotFlap(t *testing.T) {
 	first := findCall(f.calls, "rpc", "browser.cookies.set")
 	if strings.Contains(first[2], `"value":"A"`) || !strings.Contains(first[2], `"value":"B"`) {
 		t.Errorf("only the last duplicate should be sent: %s", first[2])
+	}
+}
+
+// A settings change keeps the existing hidden tab instead of opening a
+// second one on the next push.
+func TestCmuxAdapter_ReconfiguredKeepsSurface(t *testing.T) {
+	old := NewCmux("/nonexistent/cmux", []string{"%github.com"})
+	old.surfaceID = "surface:7"
+	n := old.Reconfigured("/other/cmux", []string{"%example.com"})
+	if n.surfaceID != "surface:7" {
+		t.Fatalf("surface = %q, want the old tab surface:7", n.surfaceID)
+	}
+	if n.CLIBinary() != "/other/cmux" || len(n.CookieHostPatterns()) != 1 || n.CookieHostPatterns()[0] != "%example.com" {
+		t.Fatalf("settings not applied: binary %q filter %v", n.CLIBinary(), n.CookieHostPatterns())
+	}
+}
+
+// The delta record belongs to the tab, so it follows the tab through a
+// reconfigure; dropping it would turn every settings change into a full
+// push.
+func TestCmuxAdapter_ReconfiguredKeepsDeltaRecord(t *testing.T) {
+	f := &fakeCmux{}
+	a := newTestCmux(f, nil)
+	cookies := []chrome.Cookie{{HostKey: ".example.com", Name: "s", Value: "v", Path: "/", IsSecure: 1}}
+	if err := a.Push(cookies); err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+	n := a.Reconfigured(a.binary, nil)
+	n.run, n.sleep = a.run, a.sleep
+	f.setCalls = 0
+	counts, err := n.PushCounted(context.Background(), cookies)
+	if err != nil {
+		t.Fatalf("push after reconfigure: %v", err)
+	}
+	if f.setCalls != 0 || counts.Unchanged != 1 {
+		t.Errorf("unchanged cookie resent after reconfigure: set calls %d, counts %+v", f.setCalls, counts)
 	}
 }

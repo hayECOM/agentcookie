@@ -1,6 +1,7 @@
 package sinkpush
 
 import (
+	"context"
 	"time"
 
 	"github.com/mvanhorn/agentcookie/internal/chrome"
@@ -33,8 +34,35 @@ func resetForTesting() {
 	registry = nil
 }
 
-// RunAll invokes every registered adapter against the given cookie
-// slice. For each adapter:
+// AnyInstalled reports whether at least one registered adapter, or one of
+// the per-call extra adapters, has its target CLI installed. The sink uses
+// it to skip the extra-profile Chrome Safe Storage read when no adapter
+// could consume those cookies.
+func AnyInstalled(extra ...Adapter) bool {
+	for _, a := range append(All(), extra...) {
+		if a.IsInstalled() {
+			return true
+		}
+	}
+	return false
+}
+
+// SetRegistryForTesting replaces the package registry with adapters and
+// returns a restore func. Test-only seam for callers outside this
+// package: the built-in adapters probe the real PATH, so tests that
+// depend on which adapters are installed swap the whole registry.
+func SetRegistryForTesting(adapters []Adapter) func() {
+	prev := registry
+	registry = append([]Adapter(nil), adapters...)
+	return func() { registry = prev }
+}
+
+// RunAll invokes every registered adapter, then each per-call extra
+// adapter (config-driven ones such as cmux, which the caller resolves
+// from its current config), against the given cookie slice. ctx bounds
+// delivery: adapters that implement ContextPusher get it and stop their
+// child commands when it ends, and once it is done no further adapter
+// starts (each is reported with ctx.Err()). For each adapter:
 //
 //  1. If IsInstalled returns false, the adapter is skipped (Result with
 //     Skipped=true, no error).
@@ -48,21 +76,25 @@ func resetForTesting() {
 // One adapter's failure does NOT stop subsequent adapters from running.
 // The Result slice has one entry per registered adapter, in registration
 // order, so callers can log a full report.
-func RunAll(cookies []chrome.Cookie) []Result {
+func RunAll(ctx context.Context, cookies []chrome.Cookie, extra ...Adapter) []Result {
 	// Never hand an adapter a cookie that is already expired: for the
 	// browser adapters (cmux) setting one is a delete, and for the file
 	// adapters it is a dead credential. See chrome.IsExpiredAt.
 	cookies, _ = chrome.DropExpiredForPush(cookies, time.Now())
-	adapters := All()
+	adapters := append(All(), extra...)
 	results := make([]Result, 0, len(adapters))
 	for _, a := range adapters {
-		results = append(results, runOne(a, cookies))
+		results = append(results, runOne(ctx, a, cookies))
 	}
 	return results
 }
 
-func runOne(a Adapter, cookies []chrome.Cookie) Result {
+func runOne(ctx context.Context, a Adapter, cookies []chrome.Cookie) Result {
 	r := Result{Name: a.Name()}
+	if err := ctx.Err(); err != nil {
+		r.Err = err
+		return r
+	}
 
 	if !a.IsInstalled() {
 		r.Skipped = true
@@ -92,7 +124,7 @@ func runOne(a Adapter, cookies []chrome.Cookie) Result {
 	}
 
 	if cp, ok := a.(CountingPusher); ok {
-		n, err := cp.PushCounted(valid)
+		n, err := cp.PushCounted(ctx, valid)
 		if err != nil {
 			r.Err = err
 			return r
@@ -100,7 +132,13 @@ func runOne(a Adapter, cookies []chrome.Cookie) Result {
 		r.Pushed, r.Unchanged, r.Rejected = n.Sent, n.Unchanged, n.Rejected
 		return r
 	}
-	if err := a.Push(valid); err != nil {
+	var err error
+	if cp, ok := a.(ContextPusher); ok {
+		err = cp.PushContext(ctx, valid)
+	} else {
+		err = a.Push(valid)
+	}
+	if err != nil {
 		r.Err = err
 		return r
 	}

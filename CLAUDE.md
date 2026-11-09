@@ -6,9 +6,13 @@ upstreamed yet. Treat upstream files as someone else's house style: match what i
 already there, keep diffs small, and keep every local change on a topic branch so
 it stays PR-able.
 
-- Upstream remote: `origin` → `github.com/mvanhorn/agentcookie`
-- Local patch branch: `fix/cdp-sink-keyring-and-domain-scope` (merged into local `main`)
-- Installed binary: `~/.local/bin/agentcookie` (arm64), built from local `main`
+- Remotes: `origin` → `github.com/hayECOM/agentcookie` (our fork, default
+  branch `prod`); `upstream` → `github.com/mvanhorn/agentcookie` (**never push
+  there**). `origin/main` mirrors upstream's `main`.
+- Our code lands on `prod` by PR. Upstream is merged in (never rebased) on a
+  topic branch, as in the 2026-11-09 reconcile.
+- Installed binary: `~/.local/bin/agentcookie` (arm64). Check what it was built
+  from with `go version -m ~/.local/bin/agentcookie` (`vcs.revision`).
 
 ## What it does here
 
@@ -253,6 +257,14 @@ Guards: `TestCmuxPush_RealisticSetStaysUnderFrameCap`, `TestCmuxChunks_*`,
 `TestRunAll_CountingPusherReportsWhatWasSent`, `TestAdapterPushedLine`,
 `TestCmuxPush_DuplicateKeyDoesNotFlap`.
 
+Upstream (with pull mode) made cmux a per-apply adapter: `cmuxSurfaces`
+in `internal/cli/sink.go` keeps one adapter per (binary, filter) and swaps
+it via `Reconfigured` when sink.yaml changes. `Reconfigured` carries the
+delta record along with the tab, or every settings change would cost a
+full push (`TestCmuxAdapter_ReconfiguredKeepsDeltaRecord`). Every cmux
+call also runs under the caller's ctx now (`PushCounted(ctx, ...)`), so
+pull-once's budget can stop a stalled push.
+
 Caveat: cmux exposes no per-surface browser profile in `tree`. If a
 non-default `--profile` browser tab is ever the only one open, cookies would
 land in that profile's store.
@@ -343,10 +355,13 @@ backwards: it is inert today only because the key reads fail, and if the
 keychain ever became readable, personal-browser cookies would flow into
 the synced set with no off switch.
 
-It is now gated on `!cfg.SkipChromeSQLite` -- the mode, not a new knob, so
-a normal universal-delivery sink is unaffected. Per-browser key failures
-are cached for the process (a restart re-probes), and a merge that
-actually happens is logged. The agentcookie CDP profile is excluded from
+It is gated on the mode, not a new knob, so a normal universal-delivery
+sink is unaffected. Upstream shipped the same gate independently (#137/#138:
+`safeStorageReadAllowed` in `adapterCookieSet`, plus a per-browser cache of
+permanent Keychain refusals in `getChromeDecryptKey`); the 2026-11-09
+reconcile dropped our duplicate gate and cache in favor of theirs. Ours
+still adds: a merge that actually happens is logged, the union goes through
+the `unionExtraProfiles` test seam, and the agentcookie CDP profile is excluded from
 the union: it is sealed under the automation mock-keychain key, not Safe
 Storage, so reading it with this machine's real Chrome key yields nothing
 -- and it is already the destination of the CDP write path.

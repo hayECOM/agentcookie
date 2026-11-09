@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -36,12 +37,17 @@ type Status struct {
 
 // PeerStatus mirrors the per-peer object Tailscale's status JSON emits.
 type PeerStatus struct {
+	// ID is the node's StableID, the same value WhoIs and Tincan's roster
+	// report.
+	ID             string   `json:"ID"`
 	HostName       string   `json:"HostName"`
 	DNSName        string   `json:"DNSName"`
 	TailscaleIPs   []string `json:"TailscaleIPs"`
 	ExitNodeOption bool     `json:"ExitNodeOption"`
 	ExitNode       bool     `json:"ExitNode"`
 	Online         bool     `json:"Online"`
+	// Tags are the node's ACL tags (tag:...), empty for a user-owned node.
+	Tags []string `json:"Tags"`
 }
 
 // FindCLI returns the path to the local Tailscale CLI. Checks PATH first,
@@ -57,6 +63,16 @@ func FindCLI() (string, error) {
 	return "", ErrNotInstalled
 }
 
+// cliCommand runs the Tailscale CLI in CLI mode. The macOS app's bundled
+// binary decides between CLI and GUI by looking for a terminal (TERM,
+// SHLVL); under launchd there is none, so without TAILSCALE_BE_CLI=1 it
+// tries to start the GUI and fails ("Tailscale.CLIError error 3").
+func cliCommand(ctx context.Context, cli string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, cli, args...)
+	cmd.Env = append(os.Environ(), "TAILSCALE_BE_CLI=1")
+	return cmd
+}
+
 // Get runs `tailscale status --json` and parses the result. Caller must
 // pass a non-empty cliPath (use FindCLI).
 func Get(ctx context.Context, cliPath string) (*Status, error) {
@@ -65,7 +81,7 @@ func Get(ctx context.Context, cliPath string) (*Status, error) {
 	}
 	runCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(runCtx, cliPath, "status", "--json").Output()
+	out, err := cliCommand(runCtx, cliPath, "status", "--json").Output()
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
@@ -96,6 +112,19 @@ func (s *Status) FindPeer(hostname string) *PeerStatus {
 			return p
 		}
 		if label, _, ok := strings.Cut(p.DNSName, "."); ok && strings.EqualFold(label, target) {
+			return p
+		}
+	}
+	return nil
+}
+
+// PeerByStableID returns the peer whose StableID is id, or nil.
+func (s *Status) PeerByStableID(id string) *PeerStatus {
+	if s == nil || id == "" {
+		return nil
+	}
+	for _, p := range s.Peer {
+		if p != nil && p.ID == id {
 			return p
 		}
 	}
@@ -240,11 +269,7 @@ func (s *Status) ResolvePeerIP(hostname string) (string, error) {
 // gets the current status, and resolves the hostname. Use this when you don't
 // already have a Status object.
 func ResolvePeerIPWithCLI(ctx context.Context, hostname string) (string, error) {
-	cli, err := FindCLI()
-	if err != nil {
-		return "", err
-	}
-	st, err := Get(ctx, cli)
+	st, err := CurrentStatus(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -302,4 +327,70 @@ func isIPAddress(s string) bool {
 // parseURL is a thin wrapper around url.Parse that handles common edge cases.
 func parseURL(rawURL string) (*url.URL, error) {
 	return url.Parse(rawURL)
+}
+
+// statusFunc fetches the local Tailscale status. Production finds the CLI and
+// runs `tailscale status --json`; tests replace it via SetStatusForTesting so
+// they never touch the real daemon.
+var statusFunc = func(ctx context.Context) (*Status, error) {
+	cli, err := FindCLI()
+	if err != nil {
+		return nil, err
+	}
+	return Get(ctx, cli)
+}
+
+// CurrentStatus returns the local Tailscale status through the package's
+// status seam.
+func CurrentStatus(ctx context.Context) (*Status, error) {
+	return statusFunc(ctx)
+}
+
+// SetStatusForTesting replaces the status fetcher used by CurrentStatus and
+// returns a restore func. Test-only seam.
+func SetStatusForTesting(f func(ctx context.Context) (*Status, error)) func() {
+	prev := statusFunc
+	statusFunc = f
+	return func() { statusFunc = prev }
+}
+
+// tailscaleULA is Tailscale's IPv6 ULA range, fd7a:115c:a1e0::/48.
+var tailscaleULA = netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+
+// tailscaleCGNAT is the IPv4 CGNAT range Tailscale assigns from, 100.64.0.0/10.
+var tailscaleCGNAT = netip.MustParsePrefix("100.64.0.0/10")
+
+// IsTailscaleIP reports whether s is an IP literal inside a range Tailscale
+// assigns node addresses from: 100.64.0.0/10 or fd7a:115c:a1e0::/48.
+func IsTailscaleIP(s string) bool {
+	addr, err := netip.ParseAddr(s)
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap()
+	return tailscaleCGNAT.Contains(addr) || tailscaleULA.Contains(addr)
+}
+
+// PeerByIP returns the peer whose TailscaleIPs include ip, or nil when no
+// peer carries that address.
+func (s *Status) PeerByIP(ip string) *PeerStatus {
+	if s == nil {
+		return nil
+	}
+	want, err := netip.ParseAddr(ip)
+	if err != nil {
+		return nil
+	}
+	want = want.Unmap()
+	for _, p := range s.Peer {
+		if p == nil {
+			continue
+		}
+		for _, raw := range p.TailscaleIPs {
+			if got, err := netip.ParseAddr(raw); err == nil && got.Unmap() == want {
+				return p
+			}
+		}
+	}
+	return nil
 }

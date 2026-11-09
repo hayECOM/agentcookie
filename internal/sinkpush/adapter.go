@@ -24,7 +24,9 @@
 package sinkpush
 
 import (
+	"context"
 	"strings"
+	"time"
 
 	"github.com/mvanhorn/agentcookie/internal/chrome"
 )
@@ -85,9 +87,21 @@ type PushCounts struct {
 // CountingPusher is an optional Adapter extension. RunAll prefers it to
 // Push so Result.Pushed is what was sent, not what was handed over -- a
 // delta push that sent nothing must not log "pushed 312 cookies".
+// It takes the caller's context for the same reason as ContextPusher.
 type CountingPusher interface {
-	PushCounted(cookies []chrome.Cookie) (PushCounts, error)
+	PushCounted(ctx context.Context, cookies []chrome.Cookie) (PushCounts, error)
 }
+
+// ContextPusher is implemented by adapters whose Push runs child
+// commands. RunAll calls PushContext instead of Push so the caller's
+// context (pull-once's turn budget) stops those commands.
+type ContextPusher interface {
+	PushContext(ctx context.Context, cookies []chrome.Cookie) error
+}
+
+// childWaitDelay bounds how long a context-killed child command may keep
+// its output pipes open (a grandchild it forked) before Wait gives up.
+const childWaitDelay = 2 * time.Second
 
 // Result is one adapter's outcome from a RunAll pass.
 type Result struct {
@@ -160,6 +174,29 @@ func filterByHostPatterns(cookies []chrome.Cookie, patterns []string) []chrome.C
 		}
 	}
 	return out
+}
+
+// DomainHostPatterns returns the two SQLite-LIKE patterns that select
+// cookies belonging to domain and its subdomains, and nothing else:
+// the bare domain (exact match on host_key) and "%.domain" (any
+// subdomain, with the dot forcing a label boundary). Adapters must use
+// this instead of a bare substring like "%ebay%", which also matches
+// unrelated hosts such as ebay.attacker.com or webay.com and would
+// leak those hosts' cookies into the Cookie header sent to the real
+// site. Mirrors the shape the accounts allowlist writes.
+func DomainHostPatterns(domain string) []string {
+	return []string{domain, "%." + domain}
+}
+
+// HostMatchesAnyPattern reports whether hostKey matches at least one
+// pattern under the same SQLite-LIKE semantics the push filter uses.
+func HostMatchesAnyPattern(hostKey string, patterns []string) bool {
+	for _, p := range patterns {
+		if matchLike(hostKey, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // matchLike implements a small subset of SQLite LIKE: '%' matches
