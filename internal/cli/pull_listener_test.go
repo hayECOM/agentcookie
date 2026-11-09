@@ -44,7 +44,7 @@ func TestPullListenerWaitsForTailscaleAndRebinds(t *testing.T) {
 	statuses := make(chan listenerStatus, 64)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	if err := startWatchPullListener(ctx, &config.SourceConfig{}, func(up bool, addr string) {
+	if err := startWatchPullListener(ctx, &config.SourceConfig{PullListener: config.PullListenerRef{Enabled: true}}, func(up bool, addr string) {
 		statuses <- listenerStatus{up, addr}
 	}); err != nil {
 		t.Fatalf("no Tailscale at start must not fail the daemon: %v", err)

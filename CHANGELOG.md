@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### `/pull` is opt-in and serves only configured sinks
+
+- `source --watch` no longer serves `GET /pull` by default. Set `pull_listener.enabled: true` in `source.yaml`, or list a teammate in `teammates.yaml` before `source --watch` starts, to open it. `--pull-listen` without the opt-in is an error rather than a silent no-op.
+- `/pull` now serves a paired key only when its peer is named in `sinks:` (or is a listed teammate). Before, any file under `keys/` could pull, so a sink retired from `sinks:` kept receiving the full cookie jar, localStorage and secrets bus through its leftover key. Refusals are logged and answer 403.
+- The legacy `security.shared_secret` is refused on `/pull`, with or without teammates; it cannot be tied to a configured sink.
+
 ### Live CDP sinks stop leaving a blank tab per inject
 
 - Each live CDP inject opened an `about:blank` tab in the attached Chrome and relied on chromedp closing it when the connection was cancelled, with a one-second budget. A loaded browser missed that budget, so a sink injecting on every sync left a tab behind nearly every time: one Mac sink's shared Chrome built up thousands of blank tabs and about 2.6 GB of memory in 2.3 days. Injection now talks only to the browser session (`Target.getTargets`, `Target.getBrowserContexts`, `Storage.setCookies`) and creates no tab at all.

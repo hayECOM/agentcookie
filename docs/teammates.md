@@ -104,7 +104,7 @@ agentcookie doctor
 
 `list` and `status` show each teammate's state, machine, cadence, and last pull. `doctor` adds one line per teammate and flags problems:
 
-- the pull listener is down (FAIL): no teammate can pull or pair until Tailscale is up on the laptop;
+- the pull listener is down (FAIL): no teammate can pull or pair until Tailscale is up on the laptop. The listener opens when `source --watch` starts with a teammate listed (or with `pull_listener.enabled: true` in `source.yaml`); a `teammates.yaml` first created while the daemon runs needs a restart to open it;
 - `teammates.yaml` does not load (FAIL), with the parse error;
 - `tincan` is missing or the roster shows no Tailscale nodes (WARN), fixed by `agentcookie teammates setup`;
 - a machine waiting for your approval (WARN), with the approve command;

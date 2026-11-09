@@ -355,7 +355,14 @@ agentcookie wizard install --as source --add-sink \
 
 Some sandboxes can dial out over Tailscale but cannot accept inbound HTTP, so the usual POST to the sink's `/sync` never lands and the cookie store stays empty.
 
-On the Mac, `source --watch` already serves pairing on port 9998. It now keeps a listener up during watch and adds `GET /pull` (HMAC-authenticated with the paired key) that returns the latest sealed envelope.
+On the Mac, `source --watch` can serve `GET /pull` on port 9998 (HMAC-authenticated with the paired key), which returns the latest sealed envelope. The listener is **off by default**; a push-only setup never opens the port. Turn it on in `source.yaml`:
+
+```yaml
+pull_listener:
+  enabled: true
+```
+
+(`teammates.yaml` listing a teammate also turns it on, since teammates pull.)
 
 On the blocked box, skip the sync listener and poll:
 
@@ -369,7 +376,7 @@ agentcookie sink --pull-from <mac-hostname> --pull-interval 30s
 
 `--pull-from` accepts a hostname, `host:port`, or a full URL. Bare hostnames default to `http://<host>:9998/pull`. The poll client honors `HTTP_PROXY` / `HTTPS_PROXY`, which is required when the sandbox only reaches the tailnet through a local proxy. Crypto, envelope format, and Chrome read/write paths are unchanged.
 
-The client-only box does not need its own `sinks:` entry on the Mac. Pairing writes the peer key; `/pull` seals with that key. Keep the Mac's existing push sinks as they are.
+The client-only box **does** need its own `sinks:` entry on the Mac, with `peer:` set to the name it paired as. `/pull` serves only listed sinks and teammates: a `keys/` file alone is not enough, so removing a sink from `sinks:` stops its pulls even though the key file stays. The legacy `security.shared_secret` is refused on `/pull`; pair the box instead. Keep the Mac's existing push sinks as they are.
 
 ## What about Chrome's device-bound cookies (DBSC)?
 

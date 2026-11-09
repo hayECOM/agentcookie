@@ -353,7 +353,7 @@ func TestStartWatchPullListenerFailsIfAddrInUse(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	err = startWatchPullListener(ctx, &config.SourceConfig{}, nil)
+	err = startWatchPullListener(ctx, &config.SourceConfig{PullListener: config.PullListenerRef{Enabled: true}}, nil)
 	if err == nil {
 		t.Fatal("expected bind error when pull listen address is occupied")
 	}

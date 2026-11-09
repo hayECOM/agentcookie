@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestLoadSourceMissing(t *testing.T) {
@@ -1012,8 +1014,11 @@ chrome:
 // Covers R12: teammate mode adds no keys to source.yaml, so an older binary
 // (strict KnownFields decoding of this same struct) still loads it. Pinning
 // the YAML key set makes any new source.yaml key fail here first.
+// pull_listener is the one deliberate addition: it is opt-in and omitted
+// when off (TestSourceConfigOmitsPullListenerWhenOff), so only a source.yaml
+// that turns /pull on needs a binary that knows the key.
 func TestSourceConfigYAMLKeysUnchangedForOlderBinaries(t *testing.T) {
-	want := []string{"browser", "cdp_source", "chrome", "cmux", "peer", "security", "sink", "sinks"}
+	want := []string{"browser", "cdp_source", "chrome", "cmux", "peer", "pull_listener", "security", "sink", "sinks"}
 	var got []string
 	for f := range reflect.TypeFor[SourceConfig]().Fields() {
 		tag := f.Tag.Get("yaml")
@@ -1141,5 +1146,17 @@ security:
 	}
 	if !strings.Contains(err.Error(), "decode") || !strings.Contains(err.Error(), "enabeld") {
 		t.Errorf("error should be a strict decode failure naming the key, got %v", err)
+	}
+}
+
+// A source.yaml written with /pull off must not carry pull_listener, or an
+// older binary's strict decode would refuse it.
+func TestSourceConfigOmitsPullListenerWhenOff(t *testing.T) {
+	out, err := yaml.Marshal(&SourceConfig{Sink: SinkRef{URL: "http://mini:9999/sync"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "pull_listener") {
+		t.Fatalf("pull_listener written while off:\n%s", out)
 	}
 }

@@ -94,7 +94,7 @@ func newAuthFixture(t *testing.T, teammatesYAML string) *authFixture {
 		hub:   hub,
 		whois: installFakeWhoIs(t),
 		cache: cache,
-		h:     newPullHandlerWithAuth(cache, newPullAuthorizer(dir, legacyKey, hub)),
+		h:     newPullHandlerWithAuth(cache, newPullAuthorizer(dir, legacyKey, []string{musePeer}, hub)),
 	}
 }
 
@@ -202,10 +202,14 @@ func TestSuspendedTeammatesRefused(t *testing.T) {
 	}
 }
 
-func TestLegacySharedSecretRefusedOnceTeammatesExist(t *testing.T) {
+// The legacy shared secret cannot be tied to a configured sink, so /pull
+// refuses it with or without teammates.
+//
+// Guard-revert: let peer.legacy through in authorizePull and this goes red.
+func TestLegacySharedSecretRefusedOnPull(t *testing.T) {
 	f := newAuthFixture(t, "")
-	if rec := f.pull(t, legacyKey, strangerIP); rec.Code != http.StatusOK {
-		t.Fatalf("without teammates the legacy secret still pulls, got %d", rec.Code)
+	if rec := f.pull(t, legacyKey, strangerIP); rec.Code != http.StatusForbidden {
+		t.Fatalf("legacy secret without teammates status = %d, want 403", rec.Code)
 	}
 	f = newAuthFixture(t, "teammates:\n  - name: grokbot\n")
 	if rec := f.pull(t, legacyKey, strangerIP); rec.Code != http.StatusForbidden {
@@ -445,7 +449,7 @@ func newNilStoreAuthFixture(t *testing.T, body string) *authFixture {
 		hub:   hub,
 		whois: installFakeWhoIs(t),
 		cache: cache,
-		h:     newPullHandlerWithAuth(cache, newPullAuthorizer(dir, legacyKey, hub)),
+		h:     newPullHandlerWithAuth(cache, newPullAuthorizer(dir, legacyKey, []string{musePeer}, hub)),
 	}
 }
 
@@ -534,7 +538,7 @@ func TestTeammatePullRefusedWhenNeverLoaded(t *testing.T) {
 	installFakeWhoIs(t)
 	cache := newPullCache()
 	cache.Store([]byte(testEnvJSON))
-	f := &authFixture{dir: dir, hub: hub, cache: cache, h: newPullHandlerWithAuth(cache, newPullAuthorizer(dir, legacyKey, hub))}
+	f := &authFixture{dir: dir, hub: hub, cache: cache, h: newPullHandlerWithAuth(cache, newPullAuthorizer(dir, legacyKey, []string{musePeer}, hub))}
 	if rec := f.pull(t, grokKey, grokIP); rec.Code != http.StatusForbidden {
 		t.Fatalf("never-loaded teammates.yaml: status = %d, want 403", rec.Code)
 	}

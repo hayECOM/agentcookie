@@ -33,7 +33,7 @@ func newPairFixture(t *testing.T, node string) *pairFixture {
 	if err := keystore.Delete(f.dir, "grokbot"); err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(newPullMux(f.dir, "", f.cache, f.hub))
+	srv := httptest.NewServer(newPullMux(f.dir, "", nil, f.cache, f.hub))
 	t.Cleanup(srv.Close)
 	return &pairFixture{authFixture: f, srv: srv}
 }
@@ -64,7 +64,7 @@ func TestPairRouteClosedWithoutPendingPairing(t *testing.T) {
 // Without teammates.yaml /pair is a 404 exactly as before.
 func TestPairRouteAbsentWithoutTeammates(t *testing.T) {
 	f := newAuthFixture(t, "")
-	srv := httptest.NewServer(newPullMux(f.dir, "", f.cache, f.hub))
+	srv := httptest.NewServer(newPullMux(f.dir, "", nil, f.cache, f.hub))
 	defer srv.Close()
 	resp, err := http.Post(srv.URL+"/pair", "application/json", strings.NewReader(`{}`))
 	if err != nil {

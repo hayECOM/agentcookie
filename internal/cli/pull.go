@@ -206,9 +206,9 @@ func newPullHandlerWithAuth(cache *pullCache, auth pullAuth) http.Handler {
 
 // newPullMux builds the 9998 handler once, so a rebind on a tailnet IP
 // change keeps serving the same state.
-func newPullMux(configDir, legacy string, cache *pullCache, hub *teammateHub) http.Handler {
+func newPullMux(configDir, legacy string, sinkPeers []string, cache *pullCache, hub *teammateHub) http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("/pull", newPullHandlerWithAuth(cache, newPullAuthorizer(configDir, legacy, hub)))
+	mux.Handle("/pull", newPullHandlerWithAuth(cache, newPullAuthorizer(configDir, legacy, sinkPeers, hub)))
 	if hub != nil {
 		// Teammate pairing (KTD7) shares this server so it never fights
 		// `source --watch` for port 9998. It is a 404 unless a teammate
@@ -254,8 +254,16 @@ func setPullListenerSeamsForTesting(ipFn func(context.Context) (string, error), 
 	}
 }
 
-// startWatchPullListener serves GET /pull for the life of source --watch.
-// An explicit --pull-listen binds once and fails the command on error. The
+// pullListenerWanted reports whether source --watch serves /pull: only
+// when source.yaml opts in (pull_listener.enabled) or teammates.yaml
+// lists a teammate (teammates pull and pair on this port). A push-only
+// pair keeps 9998 closed.
+func pullListenerWanted(cfg *config.SourceConfig, hub *teammateHub) bool {
+	return (cfg != nil && cfg.PullListener.Enabled) || hub.Active()
+}
+
+// startWatchPullListener serves GET /pull for the life of source --watch,
+// when pullListenerWanted. An explicit --pull-listen binds once and fails the command on error. The
 // default tailnet address is supervised (KTD9): when Tailscale is not up
 // yet the listener retries with backoff instead of staying off for the
 // life of the daemon, and it rebinds when the tailnet IP changes. A
@@ -266,11 +274,18 @@ func startWatchPullListener(ctx context.Context, cfg *config.SourceConfig, onSta
 	if onStatus == nil {
 		onStatus = func(bool, string) {}
 	}
+	if !pullListenerWanted(cfg, activeTeammates) {
+		if sourcePullListen != "" {
+			return fmt.Errorf("--pull-listen %s: the /pull listener is off; set pull_listener.enabled: true in source.yaml", sourcePullListen)
+		}
+		fmt.Fprintln(os.Stderr, "agentcookie source --watch: /pull listener off (pull_listener.enabled is not set and no teammates are listed)")
+		return nil
+	}
 	legacy := ""
 	if cfg != nil {
 		legacy = cfg.Security.SharedSecret
 	}
-	handler := newPullMux(common.ConfigDir, legacy, pullPayloadCache, activeTeammates)
+	handler := newPullMux(common.ConfigDir, legacy, sinkPeerNames(cfg), pullPayloadCache, activeTeammates)
 	if sourcePullListen != "" {
 		addr, err := resolveSourcePullListen(ctx, sourcePullListen)
 		if err != nil {

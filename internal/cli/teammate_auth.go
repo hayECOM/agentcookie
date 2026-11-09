@@ -3,13 +3,16 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/mvanhorn/agentcookie/internal/config"
 	"github.com/mvanhorn/agentcookie/internal/pairing"
 	"github.com/mvanhorn/agentcookie/internal/state"
 	"github.com/mvanhorn/agentcookie/internal/transport"
@@ -170,20 +173,44 @@ func legacySecretsAuth(secrets func() []string) pullAuth {
 
 // pullAuthorizer authorizes GET /pull per KTD8. A matched key resolves to a
 // peer name. A teammate name must be listed, not suspended, and calling
-// from its bound Tailscale node. Any other paired peer keeps today's
-// behavior. The legacy shared secret is refused once teammates exist.
-// With no teammates.yaml it reduces exactly to legacySecretsAuth.
+// from its bound Tailscale node. Any other paired peer must be one of
+// source.yaml's sinks: a keys/ file alone is not enough, because a sink
+// retired from `sinks:` keeps its key file (there is no unpair for plain
+// peers) and would otherwise pull the whole jar forever. The legacy shared
+// secret is never accepted on /pull; it is unattributable, so it cannot be
+// tied to a configured sink.
 type pullAuthorizer struct {
 	configDir string
 	legacy    string
+	sinkPeers []string
 	hub       *teammateHub
 }
 
-func newPullAuthorizer(configDir, legacy string, hub *teammateHub) *pullAuthorizer {
-	return &pullAuthorizer{configDir: configDir, legacy: legacy, hub: hub}
+// newPullAuthorizer authorizes /pull for teammates listed in hub and for
+// the peers named in sinkPeers (source.yaml's resolved sinks). legacy is
+// the shared secret, recognized only to be refused.
+func newPullAuthorizer(configDir, legacy string, sinkPeers []string, hub *teammateHub) *pullAuthorizer {
+	return &pullAuthorizer{configDir: configDir, legacy: legacy, sinkPeers: sinkPeers, hub: hub}
+}
+
+// sinkPeerNames returns the peer names of cfg's resolved sinks: the only
+// plain (non-teammate) keys /pull will serve.
+func sinkPeerNames(cfg *config.SourceConfig) []string {
+	if cfg == nil {
+		return nil
+	}
+	var names []string
+	for _, s := range cfg.ResolvedSinks() {
+		if s.Peer != "" {
+			names = append(names, s.Peer)
+		}
+	}
+	return names
 }
 
 func (a *pullAuthorizer) authorizePull(r *http.Request) pullDecision {
+	// The legacy secret stays a candidate only so it is refused by name
+	// below instead of looking like a bad signature.
 	peers := pullAuthPeers(a.configDir, a.legacy)
 	secrets := make([]string, len(peers))
 	for i, p := range peers {
@@ -202,20 +229,30 @@ func (a *pullAuthorizer) authorizePull(r *http.Request) pullDecision {
 		}
 	}
 	if peer.legacy {
-		if a.hub.Active() {
-			fmt.Fprintf(a.hub.log, "agentcookie source: refused /pull with the legacy shared secret from %s: teammates are configured\n", r.RemoteAddr)
-			return denyPull(http.StatusForbidden, "legacy shared secret is not accepted while teammates are configured")
-		}
-		return pullDecision{secret: matched}
+		fmt.Fprintf(a.hub.logOut(), "agentcookie source: refused /pull with the legacy shared secret from %s: pair the sink and list it in sinks:\n", r.RemoteAddr)
+		return denyPull(http.StatusForbidden, "the legacy shared secret is not accepted on /pull; pair this sink")
 	}
 	if a.hub.Unclassifiable() {
 		fmt.Fprintf(a.hub.log, "agentcookie source: refused /pull with %s's key from %s: teammate state is unavailable, so it cannot be told apart from a teammate\n", peer.name, r.RemoteAddr)
 		return denyPull(http.StatusForbidden, "teammate state is unavailable; pulls are refused until it loads")
 	}
 	if !a.hub.IsTeammateName(peer.name) {
+		if !slices.Contains(a.sinkPeers, peer.name) {
+			fmt.Fprintf(a.hub.logOut(), "agentcookie source: refused /pull with %s's key from %s: not a sink in source.yaml\n", peer.name, r.RemoteAddr)
+			return denyPull(http.StatusForbidden, "not a configured sink")
+		}
 		return pullDecision{secret: matched}
 	}
 	return a.hub.authorizeTeammatePull(r, peer.name, matched)
+}
+
+// logOut is where /pull refusals are logged: the hub's log, or stderr
+// when no hub exists.
+func (h *teammateHub) logOut() io.Writer {
+	if h == nil || h.log == nil {
+		return os.Stderr
+	}
+	return h.log
 }
 
 // authorizeTeammatePull applies the teammate rules for name, whose key

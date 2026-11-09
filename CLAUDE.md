@@ -402,6 +402,20 @@ means writing the machine's real Chrome profile, which needs a Chrome Safe
 Storage Keychain prompt that a headless mini has no GUI session to answer --
 the reason `skip_chrome_sqlite` was set in the first place.
 
+## `/pull` is opt-in and sink-scoped (local patch, 2026-11-09)
+
+Upstream's pull mode made every `source --watch` serve `GET /pull` on
+100.x:9998 and authorized any file under `keys/` plus the legacy shared
+secret. A sink retired from `sinks:` keeps its key file (no unpair for
+plain peers), so it kept pulling the whole jar. Now: the listener starts
+only with `pull_listener.enabled: true` in source.yaml or a listed
+teammate (`pullListenerWanted`); a plain key must belong to a peer in
+`ResolvedSinks()` (`sinkPeerNames`); the legacy secret is refused. This
+is the laptop (source) half; the mini sink does not serve `/pull`.
+Guards: `TestPullRefusesKeyOfSinkNotInSinksList`,
+`TestLegacySharedSecretRefusedOnPull`, `TestPullListenerOffWithoutOptIn`,
+`TestPullListenerServesListedSinkWhenOptedIn`.
+
 ## Known rough edges (not fixed)
 
 - `sink.err.log` is unrotated and was ~44 MB as of 2026-08-13.

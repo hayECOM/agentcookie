@@ -45,6 +45,16 @@ type SourceConfig struct {
 	// browser. Independent of the sink/peer push path; absent = loop off.
 	// Reuses the CmuxRef shape (see SinkConfig.Cmux).
 	Cmux CmuxRef `yaml:"cmux,omitempty" json:"cmux,omitempty"`
+	// PullListener opts `source --watch` into serving GET /pull (Tailscale
+	// 100.x:9998) for sinks that poll instead of accepting a push. Off by
+	// default: a push-only pair never needs the port open. teammates.yaml
+	// listing a teammate turns it on as well, since teammates pull.
+	PullListener PullListenerRef `yaml:"pull_listener,omitempty" json:"pull_listener,omitempty"`
+}
+
+// PullListenerRef is source.yaml's `pull_listener:` block.
+type PullListenerRef struct {
+	Enabled bool `yaml:"enabled" json:"enabled"`
 }
 
 // SinkConfig captures the sink machine's settings.
