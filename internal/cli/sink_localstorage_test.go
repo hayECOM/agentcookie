@@ -16,6 +16,7 @@ import (
 	"github.com/mvanhorn/agentcookie/internal/chrome"
 	"github.com/mvanhorn/agentcookie/internal/config"
 	"github.com/mvanhorn/agentcookie/internal/protocol"
+	"github.com/mvanhorn/agentcookie/internal/sinkpush"
 	"github.com/mvanhorn/agentcookie/internal/state"
 	"github.com/mvanhorn/agentcookie/internal/transport"
 )
@@ -40,7 +41,8 @@ func newLSFixture(t *testing.T, cfg *config.SinkConfig) *lsFixture {
 	stateWriter := state.NewWriter(filepath.Join(t.TempDir(), "sink-state.json"))
 	sinkState := &state.SinkState{Role: "sink", ListenAddr: cfg.Listen.Addr}
 	var stateMu sync.Mutex
-	mux := newSinkMux(cfg, secret, []byte("0123456789abcdef"), protocol.NewSequenceTracker(), stateWriter, sinkState, &stateMu)
+	reinject := newLiveCDPReinjector(cfg, stateWriter, sinkState, &stateMu)
+	mux := newSinkMux(cfg, secret, []byte("0123456789abcdef"), protocol.NewSequenceTracker(), stateWriter, sinkState, &stateMu, reinject)
 	return &lsFixture{mux: mux, secret: secret}
 }
 
@@ -74,8 +76,8 @@ func testCookies() []chrome.Cookie {
 // Chrome Safe Storage; running the union there probes the Keychain once
 // per browser per /sync, inside the request handler.
 //
-// Guard-revert: drop the `if !cfg.SkipChromeSQLite` around the union
-// call and this goes red.
+// Guard-revert: drop the safeStorageReadAllowed check in
+// adapterCookieSet and this goes red.
 func TestSinkSkipMode_DoesNotScanThisMachinesBrowsers(t *testing.T) {
 	called := false
 	restore := SetExtraProfileUnionForTesting(func(c []chrome.Cookie, _ string, _ *protocol.BlocklistMatcher) []chrome.Cookie {
@@ -83,6 +85,8 @@ func TestSinkSkipMode_DoesNotScanThisMachinesBrowsers(t *testing.T) {
 		return c
 	})
 	defer restore()
+	// An installed adapter, so only the skip_chrome_sqlite gate can stop it.
+	t.Cleanup(sinkpush.SetRegistryForTesting([]sinkpush.Adapter{&recordingAdapter{installed: true}}))
 
 	f := newLSFixture(t, &config.SinkConfig{SkipChromeSQLite: true})
 	if rec := f.post(t, 1, testCookies(), nil); rec.Code != http.StatusOK {
@@ -103,6 +107,9 @@ func TestSinkUniversalMode_StillUnionsExtraProfiles(t *testing.T) {
 		return c
 	})
 	defer restore()
+
+	// The union only runs when an installed adapter can consume it (#137).
+	t.Cleanup(sinkpush.SetRegistryForTesting([]sinkpush.Adapter{&recordingAdapter{installed: true}}))
 
 	// An empty cookie set keeps applyEnvelopeToSink off the SQLite path
 	// (nothing to write) while still reaching the union, which upstream

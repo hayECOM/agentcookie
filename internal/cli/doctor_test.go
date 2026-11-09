@@ -341,6 +341,23 @@ func TestCheckSourceState(t *testing.T) {
 			t.Errorf("detail should name the failing sink, got %q", c.Detail)
 		}
 	})
+	t.Run("carried-over per-sink failure warns with zero run totals", func(t *testing.T) {
+		st := &state.SourceState{
+			LastPush:    time.Now(),
+			TotalPushes: 1,
+			Sinks: []state.SinkPushState{
+				{Peer: "alpha", URL: "http://a.test/sync", TotalPushes: 1},
+				{Peer: "bravo", URL: "http://b.test/sync", TotalFailures: 2, ConsecutiveFailures: 2, LastError: "connection refused", BackoffUntil: time.Now().Add(time.Minute)},
+			},
+		}
+		c := checkSourceStateFrom(st, nil)
+		if c.Severity != SeverityWarn {
+			t.Fatalf("got %q (%q)", c.Severity, c.Detail)
+		}
+		if !strings.Contains(c.Detail, "bravo") || strings.Contains(c.Detail, "total failures") {
+			t.Errorf("detail should name the failing sink without a zero total, got %q", c.Detail)
+		}
+	})
 	t.Run("healthy multi-sink notes sink count", func(t *testing.T) {
 		st := &state.SourceState{
 			LastPush: time.Now(),
@@ -383,6 +400,32 @@ func TestCheckDBSC(t *testing.T) {
 		}
 		if c.Remediation == "" {
 			t.Fatalf("expected remediation guidance")
+		}
+	})
+}
+
+func TestCheckSecretsBus(t *testing.T) {
+	t.Run("skipped", func(t *testing.T) {
+		c := checkSecretsBusFrom(&state.SourceState{LastPush: time.Now(), LastSecretsSkipped: true})
+		if c.Severity != SeverityOK {
+			t.Fatalf("got %q (%q)", c.Severity, c.Detail)
+		}
+		if c.Detail != "skipped (--skip-secrets or AGENTCOOKIE_SKIP_SECRETS)" {
+			t.Fatalf("detail = %q", c.Detail)
+		}
+	})
+	t.Run("shipping", func(t *testing.T) {
+		c := checkSecretsBusFrom(&state.SourceState{LastPush: time.Now(), LastSecretsCLIs: 3})
+		if c.Severity != SeverityOK {
+			t.Fatalf("got %q (%q)", c.Severity, c.Detail)
+		}
+		if c.Detail != "shipping 3 cli(s)" {
+			t.Fatalf("detail = %q", c.Detail)
+		}
+	})
+	t.Run("no state is OK", func(t *testing.T) {
+		if c := checkSecretsBusFrom(nil); c.Severity != SeverityOK {
+			t.Fatalf("got %q (%q)", c.Severity, c.Detail)
 		}
 	})
 }
@@ -727,6 +770,19 @@ func TestHostMatchesAnyAdapter(t *testing.T) {
 	if hostMatchesAnyAdapter(".example.com", adapters) {
 		t.Errorf("did not expect match for .example.com")
 	}
+	// Look-alike hosts must not count as covered. The old substring
+	// approximation matched these.
+	domainAdapters := []sinkpush.Adapter{&stubAdapter{patterns: sinkpush.DomainHostPatterns("ebay.com")}}
+	for _, h := range []string{"ebay.com", ".ebay.com", "www.ebay.com"} {
+		if !hostMatchesAnyAdapter(h, domainAdapters) {
+			t.Errorf("expected match for %s", h)
+		}
+	}
+	for _, h := range []string{"webay.com", "ebay.evil.com", "ebay.com.attacker.net"} {
+		if hostMatchesAnyAdapter(h, domainAdapters) {
+			t.Errorf("did not expect match for look-alike %s", h)
+		}
+	}
 	// Empty pattern shouldn't crash; treated as non-matching.
 	emptyAdapter := []sinkpush.Adapter{&stubAdapter{patterns: []string{"%"}}}
 	if hostMatchesAnyAdapter("anything", emptyAdapter) {
@@ -787,8 +843,9 @@ peer:
 	// session health check (source role only; present here since this fixture
 	// is source). Linux sink polish added Live CDP endpoint + Daemon binary
 	// path checks. Chrome extra profile discovery added the Chrome stores check.
-	if got := len(report.Checks); got != 23 {
-		t.Fatalf("got %d checks, want 23", got)
+	// --skip-secrets added the Secrets push check (source role only).
+	if got := len(report.Checks); got != 24 {
+		t.Fatalf("got %d checks, want 24", got)
 	}
 
 	// Serialize the envelope and confirm it round-trips.
@@ -1079,4 +1136,28 @@ func TestCheckDaemonBinaryPath(t *testing.T) {
 			t.Fatalf("got %q, want OK (no plist files)", c.Severity)
 		}
 	})
+}
+
+// TestCheckChromeStores_SkipChromeSQLiteListsWithoutReading covers #137 for
+// doctor: under skip_chrome_sqlite the Chrome stores check still lists the
+// discovered stores, reports INFO, and never reads Chrome Safe Storage.
+func TestCheckChromeStores_SkipChromeSQLiteListsWithoutReading(t *testing.T) {
+	skipUnlessDarwin(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	seedExtraChromeProfile(t, home, []chrome.Cookie{
+		{HostKey: ".example.com", Name: "extra", Value: "v", Path: "/"},
+	})
+	stub := stubChromeDecryptKey(t, func(int) ([]byte, error) { return safeStorageTestKey, nil })
+
+	c := checkChromeStores(&config.SinkConfig{SkipChromeSQLite: true})
+	if n := stub.count(); n != 0 {
+		t.Errorf("Chrome Safe Storage read %d time(s) under skip_chrome_sqlite; want 0", n)
+	}
+	if c.Severity != SeverityInfo {
+		t.Errorf("severity = %q, want INFO (detail %q)", c.Severity, c.Detail)
+	}
+	if !strings.Contains(c.Detail, "chrome/chrome-profile") || !strings.Contains(c.Detail, "skip_chrome_sqlite") {
+		t.Errorf("detail should list the store and name skip_chrome_sqlite; got %q", c.Detail)
+	}
 }

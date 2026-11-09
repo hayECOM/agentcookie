@@ -23,7 +23,6 @@ import (
 	"github.com/mvanhorn/agentcookie/internal/config"
 	"github.com/mvanhorn/agentcookie/internal/keystore"
 	"github.com/mvanhorn/agentcookie/internal/launchd"
-	"github.com/mvanhorn/agentcookie/internal/livecdp"
 	"github.com/mvanhorn/agentcookie/internal/secretsbus"
 	"github.com/mvanhorn/agentcookie/internal/sinkpush"
 	"github.com/mvanhorn/agentcookie/internal/state"
@@ -78,6 +77,14 @@ type doctorDeps struct {
 	SourceAdapterPassword      func(chrome.Browser) (string, error)
 	SourceAdapterDecrypt       func(path string, key []byte) error
 
+	// Home is the user's home directory (teammates-state.json lives under
+	// it). Now is the clock for teammate ages; nil means time.Now.
+	// NodeTags returns a Tailscale node's ACL tags by StableID; nil means
+	// the live `tailscale status --json` lookup.
+	Home     string
+	Now      func() time.Time
+	NodeTags func(nodeID string) ([]string, error)
+
 	// CmuxSessionHealth verifies that browser-bound-session hosts (e.g.
 	// github.com) actually authenticate in the live cmux browser. Injected so
 	// tests don't open a real browser surface; nil falls back to the live
@@ -108,6 +115,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	home, _ := os.UserHomeDir()
 	deps := doctorDeps{
 		ConfigDir:       common.ConfigDir,
+		Home:            home,
 		BinarySignature: probeBinarySignature,
 		TailscaleIP: func() (string, error) {
 			return tsclient.RequireTailnetIP(context.Background())
@@ -207,6 +215,7 @@ func buildReport(d doctorDeps) DoctorReport {
 		st, err := d.LoadSourceState()
 		checks = append(checks, checkSourceStateFrom(st, err))
 		checks = append(checks, checkDBSCFrom(st))
+		checks = append(checks, checkSecretsBusFrom(st))
 		checks = append(checks, checkSourceAdapter(srcCfg, d.SourceAdapterCookiesExists, d.SourceAdapterPassword, d.SourceAdapterDecrypt))
 	} else {
 		checks = append(checks, Check{
@@ -220,6 +229,10 @@ func buildReport(d doctorDeps) DoctorReport {
 			Detail:   "sink-only install",
 		})
 	}
+
+	// 7a. Teammates -- only when teammates.yaml exists: the pull
+	// listener, the list, Tincan, and one line per teammate.
+	checks = append(checks, checkTeammates(d)...)
 
 	// 8. Sealing -- sink role only.
 	if sinkCfg != nil {
@@ -351,11 +364,7 @@ func buildReport(d doctorDeps) DoctorReport {
 	// 15. Chrome stores -- lists discovered Chrome profile stores and
 	// skip reasons. Informational (INFO/OK), never FAIL.
 	// Include config's CDP.ProfileDir if set.
-	cdpProfileDir := ""
-	if sinkCfg != nil {
-		cdpProfileDir = sinkCfg.CDP.ProfileDir
-	}
-	checks = append(checks, checkChromeStores(cdpProfileDir))
+	checks = append(checks, checkChromeStores(sinkCfg))
 
 	exit := 0
 	for _, c := range checks {
@@ -988,9 +997,16 @@ func checkSourceStateFrom(st *state.SourceState, err error) Check {
 			Remediation: "run `agentcookie source --once` to manually trigger a push",
 		}
 	}
-	if st.TotalFailures > 0 {
-		detail := fmt.Sprintf("last push %s ago, %d total failures", age, st.TotalFailures)
-		if failing := failingSinkLabels(st); failing != "" {
+	// Per-sink records carry over across restarts while the top-level
+	// totals start from zero, so a sink whose last push failed must warn
+	// even when this run has not recorded a failure yet.
+	failing := failingSinkLabels(st)
+	if st.TotalFailures > 0 || failing != "" {
+		detail := fmt.Sprintf("last push %s ago", age)
+		if st.TotalFailures > 0 {
+			detail += fmt.Sprintf(", %d total failures", st.TotalFailures)
+		}
+		if failing != "" {
 			detail += fmt.Sprintf(" (failing sink(s): %s)", failing)
 		}
 		return Check{
@@ -1050,6 +1066,24 @@ func checkDBSCFrom(st *state.SourceState) Check {
 		Detail:      detail,
 		Remediation: "these cookies are device-bound and may not work on the sink; for Google sessions, sign the sink's Chrome into the same account (see README: DBSC)",
 	}
+}
+
+// checkSecretsBusFrom is informational: it shows whether the last push skipped
+// the secrets bus (--skip-secrets / AGENTCOOKIE_SKIP_SECRETS) or how many CLIs'
+// secrets it carried, so an owner can confirm a cookie-only source without
+// reading an envelope. It never warns. Named apart from checkSecretsBus, which
+// reports what is on disk rather than what the last push sent.
+func checkSecretsBusFrom(st *state.SourceState) Check {
+	c := Check{Name: "Secrets push", Severity: SeverityOK}
+	switch {
+	case st == nil:
+		c.Detail = "no source push recorded yet"
+	case st.LastSecretsSkipped:
+		c.Detail = "skipped (--skip-secrets or AGENTCOOKIE_SKIP_SECRETS)"
+	default:
+		c.Detail = fmt.Sprintf("shipping %d cli(s)", st.LastSecretsCLIs)
+	}
+	return c
 }
 
 // checkSealingWith is informational. It reports whether the
@@ -1125,15 +1159,17 @@ func checkAdapterCoverage(_ *config.SinkConfig) Check {
 }
 
 // hostMatchesAnyAdapter returns true if hostKey matches at least one
-// of any adapter's CookieHostPatterns. Patterns are SQLite LIKE syntax
-// with `%` wildcards; the doctor approximates them as case-sensitive
-// substring matches with `%` stripped (good enough for warn-level
-// visibility; exact match semantics live in the writer path).
+// of any adapter's CookieHostPatterns, using the same SQLite-LIKE
+// matcher the writer path uses so doctor and push never disagree.
+// Wildcard-only patterns ("%") are ignored: they carry no domain, so
+// they say nothing about whether this host is covered.
 func hostMatchesAnyAdapter(hostKey string, adapters []sinkpush.Adapter) bool {
 	for _, a := range adapters {
 		for _, p := range a.CookieHostPatterns() {
-			needle := strings.TrimSuffix(strings.TrimPrefix(p, "%"), "%")
-			if needle != "" && strings.Contains(hostKey, needle) {
+			if strings.Trim(p, "%") == "" {
+				continue
+			}
+			if sinkpush.HostMatchesAnyPattern(hostKey, []string{p}) {
 				return true
 			}
 		}
@@ -1413,10 +1449,7 @@ func checkLiveCDPEndpointWith(sinkCfg *config.SinkConfig, probe func(endpoint st
 		}
 	}
 
-	endpoint := sinkCfg.LiveCDP.Endpoint
-	if endpoint == "" {
-		endpoint = livecdp.DefaultCDPEndpoint
-	}
+	endpoint := liveCDPEndpointFor(sinkCfg)
 
 	if err := probe(endpoint); err == nil {
 		return Check{
@@ -1593,8 +1626,13 @@ func checkCookieDeliveryWith(sinkCfg *config.SinkConfig, probe func() (int, erro
 // Default profile, including agent Chromes that have Cookies but no Local
 // State. Never FAIL; OK when stores found, INFO when stores skipped or on
 // Linux (no decrypt), SKIPPED when no Chrome detected.
-// profileDir is passed to DiscoverForConfig to include a configured CDP profile.
-func checkChromeStores(profileDir string) Check {
+// sinkCfg (nil on a source-only box) supplies the configured CDP profile
+// dir, which is passed to DiscoverForConfig.
+func checkChromeStores(sinkCfg *config.SinkConfig) Check {
+	profileDir := ""
+	if sinkCfg != nil {
+		profileDir = sinkCfg.CDP.ProfileDir
+	}
 	result := chromepaths.DiscoverForConfig(profileDir)
 
 	if len(result.Stores) == 0 && len(result.Skipped) == 0 {
@@ -1632,6 +1670,31 @@ func checkChromeStores(profileDir string) Check {
 		}
 	}
 
+	// skip_chrome_sqlite: list the stores but never read Safe Storage
+	// (#137), so readability is not checked.
+	if !safeStorageReadAllowed(sinkCfg) {
+		labels := make([]string, 0, len(result.Stores))
+		for _, s := range result.Stores {
+			label := s.Browser + "/" + s.Profile
+			if s.IsDefault {
+				label += " (default)"
+			}
+			labels = append(labels, label)
+		}
+		if len(labels) > 5 {
+			labels = append(labels[:5], fmt.Sprintf("+%d more", len(result.Stores)-5))
+		}
+		detail := fmt.Sprintf("%d store(s) found", len(result.Stores))
+		if len(labels) > 0 {
+			detail += ": " + strings.Join(labels, ", ")
+		}
+		return Check{
+			Name:     "Chrome stores",
+			Severity: SeverityInfo,
+			Detail:   detail + "; readability not checked because skip_chrome_sqlite is set (agentcookie never reads Chrome Safe Storage in this mode)",
+		}
+	}
+
 	// Darwin: list stores and note which are readable.
 	var readable, unreadable []string
 	for _, s := range result.Stores {
@@ -1640,13 +1703,11 @@ func checkChromeStores(profileDir string) Check {
 			label += " (default)"
 		}
 		// Try to get the decrypt key for this browser.
-		browser, err := chrome.LookupBrowser(s.Browser)
-		if err != nil {
+		if _, err := chrome.LookupBrowser(s.Browser); err != nil {
 			unreadable = append(unreadable, label+": unsupported browser")
 			continue
 		}
-		_, err = chrome.SafeStoragePasswordFor(browser)
-		if err != nil {
+		if _, err := getChromeDecryptKey(s.Browser); err != nil {
 			if chrome.IsKeychainLocked(err) {
 				unreadable = append(unreadable, label+": keychain locked")
 			} else {

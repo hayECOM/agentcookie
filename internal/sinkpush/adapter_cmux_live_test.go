@@ -1,6 +1,7 @@
 package sinkpush
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"strings"
@@ -46,7 +47,12 @@ func TestCmuxLiveInjection(t *testing.T) {
 
 	// Push may REUSE an already-open browser tab (possibly a live page), so
 	// remember what was open before and only close a surface Push added.
-	preTree, _ := a.run("tree", "--all", "--json")
+	// Never close on an unverified snapshot: if it failed, Push could still
+	// reuse a live tab that cleanup would then misread as "new".
+	preTree, err := a.run(context.Background(), "tree", "--all", "--json")
+	if err != nil || !json.Valid([]byte(preTree)) {
+		t.Fatalf("pre-push cmux tree snapshot unusable (err=%v); refusing to run without one", err)
+	}
 	if err := a.Push(cookies); err != nil {
 		t.Fatalf("Push to live cmux failed: %v", err)
 	}
@@ -54,9 +60,9 @@ func TestCmuxLiveInjection(t *testing.T) {
 		if a.surfaceID == "" {
 			return
 		}
-		_, _ = a.run("browser", "--surface", a.surfaceID, "cookies", "clear", "--url", url)
+		_, _ = a.run(context.Background(), "browser", "--surface", a.surfaceID, "cookies", "clear", "--url", url)
 		if !strings.Contains(preTree, `"`+a.surfaceID+`"`) {
-			_, _ = a.run("rpc", "surface.close", `{"surface_id":"`+a.surfaceID+`"}`)
+			_, _ = a.run(context.Background(), "rpc", "surface.close", `{"surface_id":"`+a.surfaceID+`"}`)
 		}
 	})
 
@@ -64,7 +70,7 @@ func TestCmuxLiveInjection(t *testing.T) {
 		t.Fatal("adapter did not cache a surface after Push")
 	}
 
-	out, err := a.run("rpc", "browser.cookies.get", `{"surface_id":"`+a.surfaceID+`","url":"`+url+`"}`)
+	out, err := a.run(context.Background(), "rpc", "browser.cookies.get", `{"surface_id":"`+a.surfaceID+`","url":"`+url+`"}`)
 	if err != nil {
 		t.Fatalf("cookies.get: %v", err)
 	}

@@ -162,6 +162,27 @@ Replace:
 - `your-mac.tailnet` with your Mac's Tailscale hostname (`tailscale status` on either machine)
 - The pairing code and URL with the values printed by the Mac source wizard
 
+### Teammates: your Tincan agents pull from the laptop
+
+Give each of your own Agent Tincan agents one standing line first, then list it by name in `~/.config/agentcookie/teammates.yaml` on the laptop and approve its machine once in a dialog. (An agent that gets its pairing notice before it has the line may stop to ask you; a fresh code is sent automatically the next time it checks Tincan.) The agent then pulls fresh cookies at the start of every turn (and every 5 to 15 minutes if it is always on) over Tailscale, never through the Tincan relay. Only the Tailscale node you approved can pair or pull. Start with `agentcookie teammates setup`; `agentcookie doctor` shows each teammate's state and names a missing tailnet ACL rule. The full guide is [docs/teammates.md](docs/teammates.md).
+
+### Linux teammate agents (pull from the laptop)
+
+An agent the laptop lists as a teammate does not use the setup above. It pulls from the laptop, so it needs no listener and no inbound access:
+
+```bash
+# Install the pinned release (the laptop's pairing notice carries the tag and one SHA256 per arch)
+bash teammate-install.sh v1.2.3 amd64=<sha256> arm64=<sha256>
+
+# One-time setup, with the values from the notice
+~/.local/bin/agentcookie join --from your-mac.tailnet.ts.net --code ABCD-EFGH-IJKL --as grokbot
+
+# At the start of every turn
+~/.local/bin/agentcookie sink --pull-once
+```
+
+`join` writes a pull-mode `sink.yaml` (no `listen.addr`), a sync-all `blocklist.yaml` if none exists, pairs, and pulls once. The proxy comes from `--proxy` or the `proxy` saved in the agent's Tincan `client.json`. `--pull-once` exits 0 when cookies are current, 3 when the laptop is unreachable (retry before the first logged-in action), and 4 when the machine needs to re-pair. With `--cadence turn+timer` it also keeps one background loop pulling every 5 to 15 minutes. The tailnet ACL must let the agent's tag reach `<laptop>:9998`. For live injection into the browser the agent drives, start that browser with `--remote-debugging-port=9223 --remote-debugging-address=127.0.0.1` (the default `live_cdp.endpoint` is `http://127.0.0.1:9223`); without it cookies land only in the sidecar store for HTTP clients and the sink reports 0 contexts.
+
 ### Linux CDP source (existing browser; no SQLite access)
 
 When the authenticated browser already runs on Linux, set `cdp_source` in its
@@ -330,6 +351,33 @@ agentcookie wizard install --as source --add-sink \
 
 **Trust note:** every sink receives the same full cookie and secret set, so a compromise of the least-trusted sink exposes everything. Only list sinks you trust with the whole payload. To stop feeding a sink, remove its entry from `sinks:` and delete its `keys/<peer>.json`. The device-bound (DBSC) caveat below is per-sink and unchanged: each sink still needs its own Chrome signed into the same Google account.
 
+## Client-only sinks (inbound blocked)
+
+Some sandboxes can dial out over Tailscale but cannot accept inbound HTTP, so the usual POST to the sink's `/sync` never lands and the cookie store stays empty.
+
+On the Mac, `source --watch` can serve `GET /pull` on port 9998 (HMAC-authenticated with the paired key), which returns the latest sealed envelope. The listener is **off by default**; a push-only setup never opens the port. Turn it on in `source.yaml`:
+
+```yaml
+pull_listener:
+  enabled: true
+```
+
+(`teammates.yaml` listing a teammate also turns it on, since teammates pull.)
+
+On the blocked box, skip the sync listener and poll:
+
+```bash
+# Pairing is outbound (sink -> source /pair) and already works.
+agentcookie pair --as sink --peer <mac-hostname> \
+  --pair-url http://<mac-hostname>:9998/pair --code <code>
+
+agentcookie sink --pull-from <mac-hostname> --pull-interval 30s
+```
+
+`--pull-from` accepts a hostname, `host:port`, or a full URL. Bare hostnames default to `http://<host>:9998/pull`. The poll client honors `HTTP_PROXY` / `HTTPS_PROXY`, which is required when the sandbox only reaches the tailnet through a local proxy. Crypto, envelope format, and Chrome read/write paths are unchanged.
+
+The client-only box **does** need its own `sinks:` entry on the Mac, with `peer:` set to the name it paired as. `/pull` serves only listed sinks and teammates: a `keys/` file alone is not enough, so removing a sink from `sinks:` stops its pulls even though the key file stays. The legacy `security.shared_secret` is refused on `/pull`; pair the box instead. Keep the Mac's existing push sinks as they are.
+
 ## What about Chrome's device-bound cookies (DBSC)?
 
 Chrome's Device Bound Session Credentials (DBSC) tie a session to one machine's secure hardware so a stolen cookie cannot be replayed elsewhere. For a site that has adopted DBSC, a copied cookie works on the sink only until its short-lived window (minutes) lapses.
@@ -345,6 +393,7 @@ The secrets bus (bearer tokens, API keys, OAuth refresh tokens) is untouched by 
 ### Working today
 
 - Mac to Linux continuous sync via Tailscale `/sync`
+- Client-only sinks via `GET /pull` + `sink --pull-from` when inbound HTTP is blocked
 - Mac to Mac continuous sync (second Mac, Mac mini)
 - Live CDP injection on Linux (cookies go into Chrome's in-memory store)
 - Three cookie delivery surfaces on macOS sink (Chrome SQLite, plaintext sidecar, per-CLI adapters)
@@ -378,6 +427,7 @@ The secrets bus (bearer tokens, API keys, OAuth refresh tokens) is untouched by 
 | [Protocol v1](docs/protocol.md) | wire format spec for future client implementations |
 | [Threat model](docs/threat-model.md) | what agentcookie does and does not protect against |
 | [FAQ](docs/faq.md) | common questions |
+| [Teammates](docs/teammates.md) | Tincan agents that pull cookies from the laptop: setup, approval, rebuilds, removal |
 | [Consumption](docs/consumption.md) | how tools read synced cookies and secrets on the sink |
 | [agent-sync runbook](docs/runbook-agent-sync.md) | browserUse / agent-browser via live CDP injection |
 | [Secrets bus v2 adoption spec](docs/spec-agentcookie-secrets-bus-v2-adoption.md) | `agentcookie.toml` manifest format |

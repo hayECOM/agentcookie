@@ -131,28 +131,6 @@ func TestTarballNote_SilentWhenNothingRode(t *testing.T) {
 	}
 }
 
-// TestKeyLookupFailureCache_StopsRepeatKeychainProbes guards the cache
-// added with the extra-profile gate: without it, every /sync re-runs a
-// 10s-timeout `security find-generic-password` per browser inside the
-// request handler.
-func TestKeyLookupFailureCache_StopsRepeatKeychainProbes(t *testing.T) {
-	const browser = "test-browser-that-does-not-exist"
-	keyLookupFailures.Delete(browser)
-	t.Cleanup(func() { keyLookupFailures.Delete(browser) })
-
-	if keyLookupFailedBefore(browser) {
-		t.Fatal("a browser with no recorded failure must not be reported as failed")
-	}
-	rememberKeyLookupFailure(browser, errTestKeyLookup{})
-	if !keyLookupFailedBefore(browser) {
-		t.Error("a recorded failure must suppress the next probe")
-	}
-}
-
-type errTestKeyLookup struct{}
-
-func (errTestKeyLookup) Error() string { return "no such keychain item" }
-
 func TestExpandTildePath(t *testing.T) {
 	t.Setenv("HOME", "/tmp/fake-home")
 	cases := map[string]string{

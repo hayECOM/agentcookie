@@ -2,23 +2,34 @@
 #
 # Targets:
 #   make            - build and sign bin/agentcookie (default; not notarized)
-#   make build      - go build ./cmd/agentcookie -> bin/agentcookie
+#   make build      - go build ./cmd/agentcookie -> bin/agentcookie (native arch)
+#   make build-universal
+#                   - build a Universal 2 (arm64 + x86_64) bin/agentcookie
+#                     via lipo, so one signed binary runs on both Apple
+#                     Silicon and Intel Macs
 #   make install    - go install ./cmd/agentcookie, then sign $(GOBIN)/agentcookie
 #   make sign       - sign bin/agentcookie with the Developer ID identity
 #   make notarize   - submit bin/agentcookie to Apple's notary service
 #                     (5-30 min; required before deploying to a Mac other
 #                     than the one this build ran on)
-#   make release    - build + sign + notarize in one shot (a fully-portable
-#                     binary that launches on any Mac without prompts)
+#   make release    - build-universal + sign + notarize in one shot (a
+#                     fully-portable Universal 2 binary that launches on any
+#                     Intel or Apple Silicon Mac without prompts)
+#   make release-pinned TAG=vX.Y.Z
+#                   - the tagged release build: hash the Linux tarballs
+#                     already in dist/ (scripts/linux-release-pins.sh), run
+#                     `make release` with those digests embedded, and check
+#                     the binary carries them. Build the Linux tarballs
+#                     first; see docs/releasing.md.
 #   make verify     - print the designated requirement of bin/agentcookie
-#   make test       - go test -race ./...
+#   make test       - go test -race ./... and scripts/release_asset_test.sh
 #   make vet        - go vet ./...
 #   make clean      - remove bin/
 #
 # Build alone does not require an Apple Developer ID. Signing is split into
 # `make sign` so contributors can `make build` and `make test` without a
-# cert. CI release builds run `make` (build + sign) on a signing-enabled
-# macOS runner.
+# cert. CI release builds run `make release` (universal build + sign +
+# notarize) on a signing-enabled macOS runner.
 #
 # Override the signing identity by exporting AGENTCOOKIE_SIGN_IDENTITY. See
 # docs/runbook-v0.12-codesign.md for how to install / renew the cert.
@@ -29,15 +40,29 @@ BINARY := $(BIN_DIR)/agentcookie
 PKG := ./cmd/agentcookie
 
 # Inject the version at link time so `make build` / `make install` -- and the
-# CI release build, which runs `make` (see the comment above) -- report the
+# CI release build, which runs `make release` (see the comment above) -- report the
 # real tag instead of the "0.0.1-dev" default baked into internal/cli.Version.
 # Mirrors the -X ldflag in .goreleaser.yaml. `git describe` yields e.g. 0.17.1
 # on a tagged build or 0.17.1-2-gfe6f405 between tags; the leading v is stripped
 # to match goreleaser's {{ .Version }}. Falls back to the in-source default when
 # git is unavailable (e.g. building from a release tarball).
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v//')
+LDFLAGS :=
 ifneq ($(VERSION),)
-LDFLAGS := -X github.com/mvanhorn/agentcookie/internal/cli.Version=$(VERSION)
+LDFLAGS += -X github.com/mvanhorn/agentcookie/internal/cli.Version=$(VERSION)
+endif
+
+# The SHA256 of this release's published Linux tarballs, embedded so the
+# laptop's teammate pairing notice can pin them without downloading
+# anything. Empty (the default) builds a binary that sends no pairing
+# notice. `make release-pinned` fills them from dist/; see docs/releasing.md.
+LINUX_SHA256_AMD64 ?=
+LINUX_SHA256_ARM64 ?=
+ifneq ($(LINUX_SHA256_AMD64),)
+LDFLAGS += -X github.com/mvanhorn/agentcookie/internal/cli.releaseLinuxAMD64SHA256=$(LINUX_SHA256_AMD64)
+endif
+ifneq ($(LINUX_SHA256_ARM64),)
+LDFLAGS += -X github.com/mvanhorn/agentcookie/internal/cli.releaseLinuxARM64SHA256=$(LINUX_SHA256_ARM64)
 endif
 
 GOBIN := $(shell go env GOBIN)
@@ -45,15 +70,59 @@ ifeq ($(GOBIN),)
 GOBIN := $(shell go env GOPATH)/bin
 endif
 
-.PHONY: all build install sign notarize release verify test vet clean
+.PHONY: all build build-universal install sign notarize release release-pinned verify test vet clean
 
 all: build sign
 
-release: build sign notarize
+release: build-universal sign notarize
+
+# release-pinned - the tagged release build (docs/releasing.md). Needs the
+# Linux tarballs for TAG in dist/ already: their digests are computed here,
+# before the darwin build, and embedded in it. The checked-out commit must
+# be exactly TAG on a clean tree so the binary's version is the tag.
+release-pinned:
+	@if [[ -z "$(TAG)" ]]; then \
+	  echo "make release-pinned: set TAG, e.g. make release-pinned TAG=v1.3.0" >&2; \
+	  exit 2; \
+	fi
+	@if [[ "v$(VERSION)" != "$(TAG)" ]]; then \
+	  echo "make release-pinned: git describe gives '$(VERSION)', not $(TAG); check out the tag on a clean tree" >&2; \
+	  exit 2; \
+	fi
+	set -euo pipefail; \
+	pins="$$(scripts/linux-release-pins.sh "$(TAG)")"; \
+	echo "make release-pinned: embedding $$pins"; \
+	$(MAKE) release $$pins; \
+	scripts/linux-release-pins.sh --check-binary $(BINARY) "$(TAG)"
 
 build:
 	@mkdir -p $(BIN_DIR)
 	go build -ldflags "$(LDFLAGS)" -o $(BINARY) $(PKG)
+
+# build-universal - Produce a Universal 2 (arm64 + x86_64) binary at
+# bin/agentcookie via lipo so a single signed + notarized release runs
+# natively on both Apple Silicon and Intel Macs. CGO must stay enabled
+# (the darwin build links C for the macOS Keychain), so each slice is
+# built separately with the target arch pinned through the C compiler
+# (CC="clang -arch ..."). Pinning CC per slice makes the build host
+# irrelevant: it works whether run on an arm64 or an x86_64 Mac.
+# Plain `make build` stays native for local development.
+build-universal:
+	@mkdir -p $(BIN_DIR)
+	set -euo pipefail; \
+	CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 CC="clang -arch arm64" \
+	  go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/agentcookie-arm64 $(PKG); \
+	CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 CC="clang -arch x86_64" \
+	  go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/agentcookie-amd64 $(PKG); \
+	lipo -create \
+	  $(BIN_DIR)/agentcookie-arm64 \
+	  $(BIN_DIR)/agentcookie-amd64 \
+	  -output $(BINARY); \
+	archs="$$(lipo -archs $(BINARY))"; \
+	case "$$archs" in *arm64*) ;; *) echo "make build-universal: missing arm64 slice ($$archs)" >&2; exit 1 ;; esac; \
+	case "$$archs" in *x86_64*) ;; *) echo "make build-universal: missing x86_64 slice ($$archs)" >&2; exit 1 ;; esac; \
+	rm -f $(BIN_DIR)/agentcookie-arm64 $(BIN_DIR)/agentcookie-amd64; \
+	echo "make build-universal: wrote $(BINARY) (archs: $$archs)"
 
 # Install to $(GOBIN)/agentcookie and sign in place so steady-state
 # `make install` produces a signed binary with the same designated
@@ -85,6 +154,7 @@ verify:
 
 test:
 	go test -race ./...
+	bash scripts/release_asset_test.sh
 
 vet:
 	go vet ./...

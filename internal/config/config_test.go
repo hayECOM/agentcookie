@@ -3,9 +3,13 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestLoadSourceMissing(t *testing.T) {
@@ -960,5 +964,199 @@ func TestExampleMultiSinkConfigDecodes(t *testing.T) {
 	}
 	if got := len(cfg.ResolvedSinks()); got != 2 {
 		t.Fatalf("example should declare 2 sinks, got %d", got)
+	}
+}
+
+// Covers R1 (teammates): a source.yaml with no push sink loads when
+// teammates.yaml lists at least one teammate, and fails with neither.
+func TestLoadSourceAllowsZeroSinksWithTeammates(t *testing.T) {
+	noSink := `
+chrome:
+  db_path: /tmp/Cookies
+`
+	t.Run("neither", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "source.yaml", noSink)
+		if _, err := LoadSource(dir); err == nil {
+			t.Fatal("source.yaml with no sink and no teammates should fail")
+		}
+	})
+	t.Run("empty teammates list", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "source.yaml", noSink)
+		writeFile(t, dir, TeammatesFile, "teammates: []\n")
+		if _, err := LoadSource(dir); err == nil {
+			t.Fatal("an empty teammates list should not stand in for a sink")
+		}
+	})
+	t.Run("one teammate", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "source.yaml", noSink)
+		writeFile(t, dir, TeammatesFile, "teammates:\n  - name: grokbot\n")
+		cfg, err := LoadSource(dir)
+		if err != nil {
+			t.Fatalf("LoadSource with a teammate and no sink: %v", err)
+		}
+		if len(cfg.ResolvedSinks()) != 0 {
+			t.Fatalf("want zero push sinks, got %v", cfg.ResolvedSinks())
+		}
+	})
+	t.Run("broken teammates file", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "source.yaml", noSink)
+		writeFile(t, dir, TeammatesFile, "teammates:\n  - name: [\n")
+		if _, err := LoadSource(dir); err == nil || !strings.Contains(err.Error(), TeammatesFile) {
+			t.Fatalf("a broken teammates.yaml with no sink should fail naming the file, got %v", err)
+		}
+	})
+}
+
+// Covers R12: teammate mode adds no keys to source.yaml, so an older binary
+// (strict KnownFields decoding of this same struct) still loads it. Pinning
+// the YAML key set makes any new source.yaml key fail here first.
+// pull_listener is the one deliberate addition: it is opt-in and omitted
+// when off (TestSourceConfigOmitsPullListenerWhenOff), so only a source.yaml
+// that turns /pull on needs a binary that knows the key.
+func TestSourceConfigYAMLKeysUnchangedForOlderBinaries(t *testing.T) {
+	want := []string{"browser", "cdp_source", "chrome", "cmux", "peer", "pull_listener", "security", "sink", "sinks"}
+	var got []string
+	for f := range reflect.TypeFor[SourceConfig]().Fields() {
+		tag := f.Tag.Get("yaml")
+		name, _, _ := strings.Cut(tag, ",")
+		got = append(got, name)
+	}
+	sort.Strings(got)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("source.yaml keys = %v, want %v (teammate mode must not add source.yaml keys)", got, want)
+	}
+}
+
+// Pull mode (teammate join) never binds a listener, so sink.yaml written by
+// `agentcookie join` has no listen.addr and must still load.
+func TestLoadSinkPullModeNeedsNoListenAddr(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "sink.yaml", `
+pull:
+  from: mac.tail1234.ts.net
+  cadence: turn+timer
+  proxy: http://localhost:1055
+peer:
+  hostname: mac.tail1234.ts.net
+skip_chrome_sqlite: true
+`)
+	cfg, err := LoadSink(dir)
+	if err != nil {
+		t.Fatalf("LoadSink pull mode: %v", err)
+	}
+	if !cfg.PullMode() {
+		t.Fatal("PullMode() = false, want true")
+	}
+	if cfg.Pull.From != "mac.tail1234.ts.net" || cfg.Pull.Cadence != CadenceTurnTimer || cfg.Pull.Proxy != "http://localhost:1055" {
+		t.Fatalf("pull = %+v", cfg.Pull)
+	}
+}
+
+func TestLoadSinkPullModeRejectsUnknownCadence(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "sink.yaml", `
+pull:
+  from: mac.tail1234.ts.net
+  cadence: hourly
+peer:
+  hostname: mac.tail1234.ts.net
+`)
+	if _, err := LoadSink(dir); err == nil || !strings.Contains(err.Error(), "cadence") {
+		t.Fatalf("expected cadence error, got %v", err)
+	}
+}
+
+// TestApplyLinuxSinkDefaultsLiveCDP covers issue #149: a Linux sink must
+// honor an explicit live_cdp.enabled: false. LoadSink only applies the
+// Linux defaults when IsLinux(), so this drives the probe and the
+// defaults function directly to run on any CI OS.
+func TestApplyLinuxSinkDefaultsLiveCDP(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+		want bool
+	}{
+		{
+			name: "explicit false stays false",
+			yaml: "live_cdp:\n  enabled: false\n",
+			want: false,
+		},
+		{
+			name: "absent key with cdp off defaults to true",
+			yaml: "listen:\n  addr: 100.80.229.80:9999\n",
+			want: true,
+		},
+		{
+			name: "explicit true stays true",
+			yaml: "live_cdp:\n  enabled: true\n",
+			want: true,
+		},
+		{
+			name: "cdp enabled with no live_cdp key leaves live cdp off",
+			yaml: "cdp:\n  enabled: true\n",
+			want: false,
+		},
+		{
+			name: "live_cdp block with only endpoint counts as absent",
+			yaml: "live_cdp:\n  endpoint: http://127.0.0.1:9333\n",
+			want: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var cfg SinkConfig
+			if err := decodeYAMLStrict("sink.yaml", []byte(tc.yaml), &cfg); err != nil {
+				t.Fatalf("decodeYAMLStrict: %v", err)
+			}
+			explicit, err := probeLiveCDPEnabled([]byte(tc.yaml))
+			if err != nil {
+				t.Fatalf("probeLiveCDPEnabled: %v", err)
+			}
+			applyLinuxSinkDefaults(&cfg, explicit)
+			if cfg.LiveCDP.Enabled != tc.want {
+				t.Errorf("LiveCDP.Enabled: got %v, want %v", cfg.LiveCDP.Enabled, tc.want)
+			}
+			if !cfg.SkipChromeSQLite {
+				t.Errorf("SkipChromeSQLite: got false, want true on Linux")
+			}
+		})
+	}
+}
+
+// TestLoadSinkUnknownKeyStillStrict guards that the live_cdp probe does
+// not loosen sink.yaml validation: an unknown key still fails to load.
+func TestLoadSinkUnknownKeyStillStrict(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "sink.yaml", `
+listen:
+  addr: 100.80.229.80:9999
+live_cdp:
+  enabled: false
+  enabeld: true
+security:
+  shared_secret: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+`)
+	_, err := LoadSink(dir)
+	if err == nil {
+		t.Fatal("expected error for unknown key, got nil")
+	}
+	if !strings.Contains(err.Error(), "decode") || !strings.Contains(err.Error(), "enabeld") {
+		t.Errorf("error should be a strict decode failure naming the key, got %v", err)
+	}
+}
+
+// A source.yaml written with /pull off must not carry pull_listener, or an
+// older binary's strict decode would refuse it.
+func TestSourceConfigOmitsPullListenerWhenOff(t *testing.T) {
+	out, err := yaml.Marshal(&SourceConfig{Sink: SinkRef{URL: "http://mini:9999/sync"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "pull_listener") {
+		t.Fatalf("pull_listener written while off:\n%s", out)
 	}
 }

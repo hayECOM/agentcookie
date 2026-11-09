@@ -29,22 +29,38 @@ type ChromeStoresStatus struct {
 	CanDecrypt   bool              `json:"can_decrypt"`
 }
 
+// TeammatesStatusBlock is the teammates part of `agentcookie status`,
+// present only when teammates.yaml exists.
+type TeammatesStatusBlock struct {
+	Listed           int                `json:"listed"`
+	PullListener     string             `json:"pull_listener,omitempty"`
+	PullListenerAddr string             `json:"pull_listener_addr,omitempty"`
+	ConfigError      string             `json:"config_error,omitempty"`
+	StateError       string             `json:"state_error,omitempty"`
+	Tincan           state.TincanStatus `json:"tincan,omitzero"`
+	Teammates        []TeammateStatus   `json:"teammates,omitempty"`
+}
+
+// statusNodeTags looks up a node's Tailscale ACL tags; tests replace it.
+var statusNodeTags = liveNodeTags
+
 var statusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Print local config, cookie policy, live daemon state, discovered Chrome stores, and any load errors",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		home, _ := os.UserHomeDir()
 		st := struct {
-			Version      string               `json:"version"`
-			ConfigDir    string               `json:"config_dir"`
-			SourceConfig *config.SourceConfig `json:"source_config,omitempty"`
-			SinkConfig   *config.SinkConfig   `json:"sink_config,omitempty"`
-			Blocklist    *config.Blocklist    `json:"blocklist,omitempty"`
-			CookiePolicy string               `json:"cookie_policy,omitempty"`
-			ChromeStores *ChromeStoresStatus  `json:"chrome_stores,omitempty"`
-			SourceState  *state.SourceState   `json:"source_state,omitempty"`
-			SinkState    *state.SinkState     `json:"sink_state,omitempty"`
-			Errors       []string             `json:"errors,omitempty"`
+			Version      string                `json:"version"`
+			ConfigDir    string                `json:"config_dir"`
+			SourceConfig *config.SourceConfig  `json:"source_config,omitempty"`
+			SinkConfig   *config.SinkConfig    `json:"sink_config,omitempty"`
+			Blocklist    *config.Blocklist     `json:"blocklist,omitempty"`
+			CookiePolicy string                `json:"cookie_policy,omitempty"`
+			ChromeStores *ChromeStoresStatus   `json:"chrome_stores,omitempty"`
+			SourceState  *state.SourceState    `json:"source_state,omitempty"`
+			SinkState    *state.SinkState      `json:"sink_state,omitempty"`
+			Teammates    *TeammatesStatusBlock `json:"teammates,omitempty"`
+			Errors       []string              `json:"errors,omitempty"`
 		}{
 			Version:   Version,
 			ConfigDir: common.ConfigDir,
@@ -71,6 +87,21 @@ var statusCmd = &cobra.Command{
 		}
 		if sk, err := state.LoadSink(state.SinkPath(home)); err == nil && sk != nil {
 			st.SinkState = sk
+		}
+
+		tv := loadTeammateView(common.ConfigDir, home)
+		if tv.present {
+			tb := &TeammatesStatusBlock{Listed: tv.listed, Tincan: tv.snap.Tincan, Teammates: tv.rows}
+			if tv.cfgErr != nil {
+				tb.ConfigError = tv.cfgErr.Error()
+			}
+			if tv.stateErr != nil {
+				tb.StateError = tv.stateErr.Error()
+			}
+			if st.SourceState != nil {
+				tb.PullListener, tb.PullListenerAddr = st.SourceState.PullListener, st.SourceState.PullListenerAddr
+			}
+			st.Teammates = tb
 		}
 
 		// Discover Chrome stores. Include config's CDP.ProfileDir if set.
@@ -159,6 +190,9 @@ var statusCmd = &cobra.Command{
 				if sink.LastError != "" {
 					fmt.Printf("      last error: %s\n", sink.LastError)
 				}
+				for _, line := range sinkSkipStatusLines(sink, time.Now()) {
+					fmt.Printf("      %s\n", line)
+				}
 			}
 		}
 		if st.SinkState != nil {
@@ -197,6 +231,32 @@ var statusCmd = &cobra.Command{
 				}
 			}
 		}
+		if tb := st.Teammates; tb != nil {
+			listener := "pull listener " + orDash(tb.PullListener)
+			if tb.PullListener == "" {
+				listener = "pull listener not running"
+			}
+			if tb.PullListenerAddr != "" {
+				listener += " on " + tb.PullListenerAddr
+			}
+			fmt.Printf("  teammates: %d listed, %s\n", tb.Listed, listener)
+			if tb.ConfigError != "" {
+				fmt.Printf("    teammates.yaml does not load (all teammates suspended): %s\n", tb.ConfigError)
+			}
+			if tb.StateError != "" {
+				fmt.Printf("    teammates state unreadable: %s\n", tb.StateError)
+			}
+			if c := checkTincanForTeammates(tv, time.Now()); c.Severity != SeverityOK {
+				fmt.Printf("    tincan: %s (%s)\n", c.Detail, c.Remediation)
+			}
+			for _, r := range tb.Teammates {
+				d := diagnoseTeammate(r, tv.laptopTarget(), statusNodeTags, time.Now())
+				fmt.Printf("    %s: %s\n", r.Name, d.Detail)
+				if d.Remediation != "" && (d.Severity == SeverityWarn || d.Severity == SeverityFail) {
+					fmt.Printf("      fix: %s\n", d.Remediation)
+				}
+			}
+		}
 		if st.ChromeStores != nil && len(st.ChromeStores.Stores) > 0 {
 			decryptNote := ""
 			if !st.ChromeStores.CanDecrypt {
@@ -219,4 +279,24 @@ var statusCmd = &cobra.Command{
 		}
 		return nil
 	},
+}
+
+// sinkSkipStatusLines explains why the source is not pushing to a sink: the
+// peer was offline on the last attempt, or the sink is inside its backoff
+// window after failures. Without these a skipped sink looks like one that
+// silently stopped syncing.
+func sinkSkipStatusLines(sink state.SinkPushState, now time.Time) []string {
+	var lines []string
+	if sink.Asleep {
+		line := "asleep: Tailscale reported the peer offline"
+		if !sink.LastAsleepAt.IsZero() {
+			line += fmt.Sprintf(" %s ago", now.Sub(sink.LastAsleepAt).Round(time.Second))
+		}
+		lines = append(lines, line+"; pushes skip it until it is back online")
+	}
+	if now.Before(sink.BackoffUntil) {
+		lines = append(lines, fmt.Sprintf("backing off after %d consecutive failure(s); next retry in %s (%s)",
+			sink.ConsecutiveFailures, sink.BackoffUntil.Sub(now).Round(time.Second), sink.BackoffUntil.Local().Format(time.RFC3339)))
+	}
+	return lines
 }

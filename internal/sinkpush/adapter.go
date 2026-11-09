@@ -24,7 +24,9 @@
 package sinkpush
 
 import (
+	"context"
 	"strings"
+	"time"
 
 	"github.com/mvanhorn/agentcookie/internal/chrome"
 )
@@ -66,6 +68,41 @@ type Adapter interface {
 	Push(cookies []chrome.Cookie) error
 }
 
+// PushCounts is what an adapter actually did with the cookies one Push
+// was handed. Only adapters that do not send everything they are handed
+// (cmux's delta push) report it; see CountingPusher.
+type PushCounts struct {
+	// Total is the cookies considered, after the adapter's own filtering.
+	Total int
+	// Sent is the cookies delivered by this push.
+	Sent int
+	// Unchanged is the cookies skipped because they already landed with
+	// these exact params.
+	Unchanged int
+	// Rejected is the cookies the target refuses outright (new this push
+	// or recorded earlier). They are not resent while unchanged.
+	Rejected int
+}
+
+// CountingPusher is an optional Adapter extension. RunAll prefers it to
+// Push so Result.Pushed is what was sent, not what was handed over -- a
+// delta push that sent nothing must not log "pushed 312 cookies".
+// It takes the caller's context for the same reason as ContextPusher.
+type CountingPusher interface {
+	PushCounted(ctx context.Context, cookies []chrome.Cookie) (PushCounts, error)
+}
+
+// ContextPusher is implemented by adapters whose Push runs child
+// commands. RunAll calls PushContext instead of Push so the caller's
+// context (pull-once's turn budget) stops those commands.
+type ContextPusher interface {
+	PushContext(ctx context.Context, cookies []chrome.Cookie) error
+}
+
+// childWaitDelay bounds how long a context-killed child command may keep
+// its output pipes open (a grandchild it forked) before Wait gives up.
+const childWaitDelay = 2 * time.Second
+
 // Result is one adapter's outcome from a RunAll pass.
 type Result struct {
 	// Name carries the adapter's Name for log/status output.
@@ -81,8 +118,15 @@ type Result struct {
 	SkippedReason string
 
 	// Pushed is the count of cookies the adapter wrote on
-	// success. Zero when the adapter was skipped or errored.
+	// success (for a CountingPusher, the count it actually sent). Zero
+	// when the adapter was skipped or errored.
 	Pushed int
+
+	// Unchanged and Rejected are reported by a CountingPusher: cookies
+	// skipped because they already landed, and cookies the target refuses
+	// outright. Both zero for a plain Adapter.
+	Unchanged int
+	Rejected  int
 
 	// Invalid is the count of cookies dropped by the validator
 	// before reaching Push: cookies whose Name, Value, or HostKey
@@ -130,6 +174,29 @@ func filterByHostPatterns(cookies []chrome.Cookie, patterns []string) []chrome.C
 		}
 	}
 	return out
+}
+
+// DomainHostPatterns returns the two SQLite-LIKE patterns that select
+// cookies belonging to domain and its subdomains, and nothing else:
+// the bare domain (exact match on host_key) and "%.domain" (any
+// subdomain, with the dot forcing a label boundary). Adapters must use
+// this instead of a bare substring like "%ebay%", which also matches
+// unrelated hosts such as ebay.attacker.com or webay.com and would
+// leak those hosts' cookies into the Cookie header sent to the real
+// site. Mirrors the shape the accounts allowlist writes.
+func DomainHostPatterns(domain string) []string {
+	return []string{domain, "%." + domain}
+}
+
+// HostMatchesAnyPattern reports whether hostKey matches at least one
+// pattern under the same SQLite-LIKE semantics the push filter uses.
+func HostMatchesAnyPattern(hostKey string, patterns []string) bool {
+	for _, p := range patterns {
+		if matchLike(hostKey, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // matchLike implements a small subset of SQLite LIKE: '%' matches

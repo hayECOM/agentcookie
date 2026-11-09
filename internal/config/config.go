@@ -4,7 +4,10 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -42,6 +45,16 @@ type SourceConfig struct {
 	// browser. Independent of the sink/peer push path; absent = loop off.
 	// Reuses the CmuxRef shape (see SinkConfig.Cmux).
 	Cmux CmuxRef `yaml:"cmux,omitempty" json:"cmux,omitempty"`
+	// PullListener opts `source --watch` into serving GET /pull (Tailscale
+	// 100.x:9998) for sinks that poll instead of accepting a push. Off by
+	// default: a push-only pair never needs the port open. teammates.yaml
+	// listing a teammate turns it on as well, since teammates pull.
+	PullListener PullListenerRef `yaml:"pull_listener,omitempty" json:"pull_listener,omitempty"`
+}
+
+// PullListenerRef is source.yaml's `pull_listener:` block.
+type PullListenerRef struct {
+	Enabled bool `yaml:"enabled" json:"enabled"`
 }
 
 // SinkConfig captures the sink machine's settings.
@@ -72,7 +85,27 @@ type SinkConfig struct {
 	LiveCDP          LiveCDPRef  `yaml:"live_cdp,omitempty" json:"live_cdp,omitempty"`
 	Cmux             CmuxRef     `yaml:"cmux,omitempty" json:"cmux,omitempty"`
 	Delivery         string      `yaml:"delivery,omitempty" json:"delivery,omitempty"`
+	// Pull makes this sink a puller (a teammate written by `agentcookie
+	// join`): it polls the pinned laptop's GET /pull and never binds a
+	// listener, so listen.addr is not required.
+	Pull PullRef `yaml:"pull,omitempty" json:"pull,omitempty"`
 }
+
+// PullRef configures pull mode. From is the laptop's pinned MagicDNS name
+// (host or host:port; the port defaults to 9998). Cadence is turn or
+// turn+timer. Proxy, when set, carries every pull and pairing request and
+// wins over HTTP_PROXY/HTTPS_PROXY. As is this agent's Tincan name (join's
+// --as); pulls name it in X-Agentcookie-Teammate so a laptop serving two
+// agents on one machine knows whose key was lost.
+type PullRef struct {
+	From    string  `yaml:"from" json:"from"`
+	Cadence Cadence `yaml:"cadence,omitempty" json:"cadence,omitempty"`
+	Proxy   string  `yaml:"proxy,omitempty" json:"proxy,omitempty"`
+	As      string  `yaml:"as,omitempty" json:"as,omitempty"`
+}
+
+// PullMode reports whether sink.yaml configures pull mode.
+func (c *SinkConfig) PullMode() bool { return c != nil && c.Pull.From != "" }
 
 // CmuxRef configures the cmux cookie-delivery surface (a fourth surface
 // alongside Chrome SQLite, the sidecar, and the per-CLI adapters). When
@@ -229,7 +262,17 @@ func LoadSource(dir string) (*SourceConfig, error) {
 	}
 	sinks := cfg.ResolvedSinks()
 	if len(sinks) == 0 {
-		return nil, fmt.Errorf("%s: at least one sink is required (set sink.url, or a sinks: list)", path)
+		// Teammate mode delivers by pull only, so a source with listed
+		// teammates needs no push sink. teammates.yaml is consulted only
+		// here; source.yaml itself gains no keys (older binaries still
+		// load it with strict decoding).
+		tm, tmErr := LoadTeammates(dir)
+		if tmErr != nil {
+			return nil, fmt.Errorf("%s: no sink configured and %s did not load: %w", path, TeammatesFile, tmErr)
+		}
+		if tm == nil || len(tm.Teammates) == 0 {
+			return nil, fmt.Errorf("%s: at least one sink is required (set sink.url, or a sinks: list, or list teammates in %s)", path, TeammatesFile)
+		}
 	}
 	for i, s := range sinks {
 		if s.URL == "" {
@@ -312,9 +355,19 @@ func resolveSourcePaths(path string, cfg *SourceConfig) error {
 // LoadSink reads sink.yaml from dir.
 func LoadSink(dir string) (*SinkConfig, error) {
 	path := filepath.Join(dir, "sink.yaml")
-	var cfg SinkConfig
-	if err := loadYAML(path, &cfg); err != nil {
+	data, err := readYAMLFile(path)
+	if err != nil {
 		return nil, err
+	}
+	var cfg SinkConfig
+	if err := decodeYAMLStrict(path, data, &cfg); err != nil {
+		return nil, err
+	}
+	// Probe the same bytes for an explicit live_cdp.enabled so the Linux
+	// default below can tell "set to false" from "not set" (#149).
+	liveCDPEnabled, err := probeLiveCDPEnabled(data)
+	if err != nil {
+		return nil, fmt.Errorf("decode %s: %w", path, err)
 	}
 	cfg.Chrome.DBPath = ExpandTilde(cfg.Chrome.DBPath)
 	// v0.12 S1: no permissive default for listen.addr. Pre-v0.12 sink.yaml
@@ -323,7 +376,14 @@ func LoadSink(dir string) (*SinkConfig, error) {
 	// further upstream. Empty here is now a config error; the wizard
 	// install writes a concrete tailnet 100.x address (see
 	// internal/tsclient.RequireTailnetIP).
-	if cfg.Listen.Addr == "" {
+	// Pull mode never binds, so it needs no listen.addr.
+	if cfg.PullMode() {
+		switch cfg.Pull.Cadence {
+		case "", CadenceTurn, CadenceTurnTimer:
+		default:
+			return nil, fmt.Errorf("%s: pull.cadence must be %q or %q (got %q)", path, CadenceTurn, CadenceTurnTimer, cfg.Pull.Cadence)
+		}
+	} else if cfg.Listen.Addr == "" {
 		return nil, fmt.Errorf("%s: listen.addr is required (run `agentcookie wizard install --as sink` to detect your Tailscale 100.x address, or set it explicitly)", path)
 	}
 	if cfg.Peer.Hostname == "" && cfg.Security.SharedSecret == "" {
@@ -339,9 +399,10 @@ func LoadSink(dir string) (*SinkConfig, error) {
 		cfg.Cmux.CmuxPath = ExpandTilde(cfg.Cmux.CmuxPath)
 	}
 	// Linux sink defaults: skip Chrome SQLite (no Keychain to read Safe Storage),
-	// enable live CDP attach (inject into agent runtime's Chrome).
+	// enable live CDP attach (inject into agent runtime's Chrome) unless
+	// sink.yaml sets live_cdp.enabled explicitly.
 	if IsLinux() {
-		applyLinuxSinkDefaults(&cfg)
+		applyLinuxSinkDefaults(&cfg, liveCDPEnabled)
 	}
 	return &cfg, nil
 }
@@ -350,21 +411,39 @@ func LoadSink(dir string) (*SinkConfig, error) {
 // read Chrome Safe Storage via macOS Keychain, so it skips Chrome SQLite
 // writes by default. The primary injection path is live CDP attach to a
 // Chrome the agent runtime already started with --remote-debugging-port.
-func applyLinuxSinkDefaults(cfg *SinkConfig) {
-	// Default skip_chrome_sqlite to true on Linux: no Keychain to decrypt
-	// Chrome's SQLite, so don't try. The YAML can explicitly set it false
-	// to override (e.g., if someone implements a libsecret reader later).
-	// We only apply this if not explicitly set in YAML - but Go's default
-	// bool is false, so we check if the struct was parsed with an explicit
-	// value by setting it unconditionally.
+//
+// liveCDPEnabled is the explicit live_cdp.enabled value from sink.yaml,
+// or nil when the key is absent (see probeLiveCDPEnabled).
+func applyLinuxSinkDefaults(cfg *SinkConfig, liveCDPEnabled *bool) {
+	// skip_chrome_sqlite is always true on Linux: there is no Keychain to
+	// decrypt Chrome's SQLite, so don't try. This is forced on purpose and
+	// sink.yaml cannot turn it off.
 	cfg.SkipChromeSQLite = true
 
-	// Default live_cdp.enabled to true on Linux when not explicitly set.
-	// This is the primary Linux injection path: attach to the agent
-	// runtime's Chrome CDP port (default 9223).
-	if !cfg.CDP.Enabled {
+	// Default live_cdp.enabled to true on Linux only when sink.yaml does
+	// not set it and the launch-our-own-Chrome CDP path is off. This is
+	// the primary Linux injection path: attach to the agent runtime's
+	// Chrome CDP port (default 9223). An explicit value, including false,
+	// is kept as decoded.
+	if liveCDPEnabled == nil && !cfg.CDP.Enabled {
 		cfg.LiveCDP.Enabled = true
 	}
+}
+
+// probeLiveCDPEnabled reports whether data sets live_cdp.enabled
+// explicitly. It returns nil when the key is absent, including when the
+// live_cdp block sets only other fields. It decodes without KnownFields:
+// callers run the strict decode first, so this never loosens validation.
+func probeLiveCDPEnabled(data []byte) (*bool, error) {
+	var probe struct {
+		LiveCDP struct {
+			Enabled *bool `yaml:"enabled"`
+		} `yaml:"live_cdp"`
+	}
+	if err := yaml.NewDecoder(bytes.NewReader(data)).Decode(&probe); err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	return probe.LiveCDP.Enabled, nil
 }
 
 // validateSharedSecret enforces a 32-byte minimum on the legacy
@@ -385,15 +464,28 @@ func validateSharedSecret(path, secret string) error {
 }
 
 func loadYAML(path string, out any) error {
-	f, err := os.Open(path)
+	data, err := readYAMLFile(path)
+	if err != nil {
+		return err
+	}
+	return decodeYAMLStrict(path, data, out)
+}
+
+// readYAMLFile reads a config file, naming it in the error.
+func readYAMLFile(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("not found: %s (start from examples/ in this repo)", path)
+			return nil, fmt.Errorf("not found: %s (start from examples/ in this repo)", path)
 		}
-		return fmt.Errorf("open %s: %w", path, err)
+		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
-	defer f.Close()
-	dec := yaml.NewDecoder(f)
+	return data, nil
+}
+
+// decodeYAMLStrict decodes data into out, rejecting unknown keys.
+func decodeYAMLStrict(path string, data []byte, out any) error {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(out); err != nil {
 		return fmt.Errorf("decode %s: %w", path, err)
