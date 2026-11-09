@@ -924,6 +924,12 @@ func applySidecarOnlyToSink(cookies []chrome.Cookie) (writeResult, error) {
 	return result, nil
 }
 
+// chromeDown is the indirection seam for the quit-Chrome ceremony around
+// applyEnvelopeToSink. chromectl quits every Google Chrome on the machine,
+// a human browser on its own profile included, so tests replace it
+// (TestMain in main_test.go).
+var chromeDown = chromectl.WithChromeDown
+
 // applyEnvelopeToSink wraps the three on-disk Chrome writes in a single
 // quit-Chrome / write / relaunch-Chrome ceremony. Direct file writes are
 // the only path in v0.7: cookies via SQLite (encrypted with the
@@ -941,7 +947,7 @@ func applyEnvelopeToSink(
 	// Chrome stays quit. Launching Chrome would trigger the meta.version
 	// migration from 18 to 24 and rewrite cookies into App-Bound v20,
 	// breaking every kooky v0.2.2 reader. See plan 2026-05-17-003 U5.
-	err := chromectl.WithChromeDown(ctx, 20*time.Second, func() error {
+	err := chromeDown(ctx, 20*time.Second, func() error {
 		if len(cookies) > 0 {
 			n, err := chrome.WriteCookies(cfg.Chrome.DBPath, cookies, key)
 			result.Cookies = n
