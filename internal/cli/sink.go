@@ -658,13 +658,25 @@ func logAdapterResults(rs []sinkpush.Result) {
 		case r.Skipped:
 			fmt.Fprintf(os.Stderr, "agentcookie sink: adapter %s skipped (%s)\n", r.Name, r.SkippedReason)
 		default:
-			if r.Invalid > 0 {
-				fmt.Fprintf(os.Stderr, "agentcookie sink: adapter %s pushed %d cookies (%d invalid dropped)\n", r.Name, r.Pushed, r.Invalid)
-			} else {
-				fmt.Fprintf(os.Stderr, "agentcookie sink: adapter %s pushed %d cookies\n", r.Name, r.Pushed)
-			}
+			fmt.Fprintf(os.Stderr, "agentcookie sink: %s\n", adapterPushedLine(r))
 		}
 	}
+}
+
+// adapterPushedLine describes a successful push by what was actually
+// sent. A delta pusher (cmux) that skipped unchanged cookies says so
+// rather than claiming the whole set, and a cookie the target refuses is
+// counted on every line instead of vanishing.
+func adapterPushedLine(r sinkpush.Result) string {
+	line := fmt.Sprintf("adapter %s pushed %d cookies", r.Name, r.Pushed)
+	if r.Unchanged > 0 || r.Rejected > 0 {
+		line = fmt.Sprintf("adapter %s pushed %d changed of %d (%d unchanged, %d rejected)",
+			r.Name, r.Pushed, r.Pushed+r.Unchanged+r.Rejected, r.Unchanged, r.Rejected)
+	}
+	if r.Invalid > 0 {
+		line += fmt.Sprintf(" (%d invalid dropped)", r.Invalid)
+	}
+	return line
 }
 
 // writeResult counts what landed on the sink during one /sync.

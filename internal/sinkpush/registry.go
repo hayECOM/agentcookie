@@ -42,7 +42,8 @@ func resetForTesting() {
 //     If the filtered slice is empty, the adapter is skipped with
 //     SkippedReason="no matching cookies".
 //  3. Otherwise, Push is invoked. The Push error (if any) lands in
-//     Result.Err. Success returns Pushed=len(filtered).
+//     Result.Err. Success returns Pushed=len(filtered), or for a
+//     CountingPusher the count it actually sent.
 //
 // One adapter's failure does NOT stop subsequent adapters from running.
 // The Result slice has one entry per registered adapter, in registration
@@ -90,6 +91,15 @@ func runOne(a Adapter, cookies []chrome.Cookie) Result {
 		return r
 	}
 
+	if cp, ok := a.(CountingPusher); ok {
+		n, err := cp.PushCounted(valid)
+		if err != nil {
+			r.Err = err
+			return r
+		}
+		r.Pushed, r.Unchanged, r.Rejected = n.Sent, n.Unchanged, n.Rejected
+		return r
+	}
 	if err := a.Push(valid); err != nil {
 		r.Err = err
 		return r
