@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,6 +18,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/spf13/cobra"
 
 	"github.com/mvanhorn/agentcookie/internal/chrome"
 	"github.com/mvanhorn/agentcookie/internal/config"
@@ -1536,5 +1539,55 @@ func TestLiveCDPReinjectTickSuccessClearsStateError(t *testing.T) {
 	}
 	if cdp.LastCookies != 2 || cdp.LastContexts != 1 || cdp.TotalInjects != before.TotalInjects+1 {
 		t.Fatalf("counts after tick = %+v, want 2 cookies, 1 context, one more inject", cdp)
+	}
+}
+
+// TestRunSinkStartsLiveCDPSweep drives the real runSink startup path, not
+// the sweep helper: the helper's own tests cannot see a dropped call site,
+// which is how a merge lost it once. The listen port is taken up front, so
+// runSink wires its background work and then fails to bind.
+//
+// Guard-revert: remove startLiveCDPSweep from runSink and this goes red.
+func TestRunSinkStartsLiveCDPSweep(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+	withConfigDir(t, dir)
+
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = busy.Close() })
+
+	writeCLIFile(t, filepath.Join(dir, "sink.yaml"), "listen:\n  addr: "+busy.Addr().String()+
+		"\npeer:\n  hostname: 127.0.0.1\nsecurity:\n  shared_secret: startup-wiring-test-secret-32-bytes-long\n"+
+		"skip_chrome_sqlite: true\nlive_cdp:\n  enabled: true\n  endpoint: http://127.0.0.1:1\n")
+
+	swept := make(chan string, 1)
+	prev := liveCDPSweep
+	liveCDPSweep = func(_ context.Context, endpoint string, _ time.Duration) (int, error) {
+		select {
+		case swept <- endpoint:
+		default:
+		}
+		return 0, nil
+	}
+	t.Cleanup(func() { liveCDPSweep = prev })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	cmd := &cobra.Command{}
+	cmd.SetContext(ctx)
+	if err := runSink(cmd, nil); err == nil || !strings.Contains(err.Error(), "address already in use") {
+		t.Fatalf("runSink = %v, want it to reach the bind and fail there", err)
+	}
+
+	select {
+	case got := <-swept:
+		if got != "http://127.0.0.1:1" {
+			t.Errorf("swept %q, want the configured live_cdp endpoint", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runSink never started the live CDP stale-tab sweep")
 	}
 }
